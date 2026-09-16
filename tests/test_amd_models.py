@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from livekit.agents import AMD, NOT_GIVEN, Agent, AgentSession, inference, llm
+from livekit.agents import AMD, NOT_GIVEN, Agent, AgentSession, inference, llm, utils
 from livekit.agents.voice.amd import AMDCategory, AMDLifecycle
 from livekit.agents.voice.events import SpeechCreatedEvent
 from livekit.agents.voice.speech_handle import SpeechHandle
@@ -217,6 +218,68 @@ async def test_missing_llm_does_not_install_turn_hooks() -> None:
         assert session._turn_hooks is None
         assert session._activity._authorization_allowed.is_set()
     finally:
+        await session.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["pause", "participant", "session_on", "room_on", "listening"])
+@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+async def test_setup_failure_cleans_up_amd(
+    monkeypatch: pytest.MonkeyPatch,
+    model_factories: tuple[Mock, Mock],
+    failure: str,
+    error_type: type[BaseException],
+) -> None:
+    session = AgentSession(llm=FakeLLM(), turn_handling={"turn_detection": "manual"})
+    await session.start(Agent(instructions="Call about an appointment."))
+    activity = session._activity
+    assert activity is not None
+    room = utils.EventEmitter()
+    room_io = SimpleNamespace(room=room, set_participant=Mock())
+    session._room_io = room_io
+    detector = AMD(
+        session,
+        llm="google/gemma-4-31b-it",
+        stt="cartesia/ink-2",
+        participant_identity="callee",
+    )
+    target, method = {
+        "pause": (activity, "_pause_authorization"),
+        "participant": (room_io, "set_participant"),
+        "session_on": (session, "on"),
+        "room_on": (room, "on"),
+        "listening": (asyncio.get_running_loop(), "create_task"),
+    }[failure]
+    original = getattr(target, method)
+    error = error_type("setup failed")
+
+    def fail_setup(*args: Any, **kwargs: Any) -> Any:
+        if failure == "listening":
+            if args[0].cr_code is AMD._setup_listening.__code__:
+                raise error
+            return original(*args, **kwargs)
+        result = original(*args, **kwargs)
+        if failure == "session_on" and args[0] != "speech_created":
+            return result
+        raise error
+
+    monkeypatch.setattr(target, method, fail_setup)
+    try:
+        with pytest.raises(error_type, match="setup failed") as exc_info:
+            await detector.__aenter__()
+        assert exc_info.value is error
+        assert session.amd is None
+        assert session._turn_hooks is None
+        assert activity._authorization_allowed.is_set()
+        assert detector.lifecycle is AMDLifecycle.FINISHED
+        assert not detector._tasks
+        for emitter, event, handler in detector._subscriptions:
+            assert handler not in emitter._events.get(event, ())
+        for factory in model_factories:
+            factory.return_value.aclose.assert_awaited_once()
+    finally:
+        await detector.aclose()
+        session._room_io = None
         await session.aclose()
 
 

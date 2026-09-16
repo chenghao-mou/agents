@@ -6,6 +6,7 @@ import json
 from unittest.mock import Mock
 
 import pytest
+from pydantic import ValidationError
 
 from livekit.agents import llm
 from livekit.agents.llm.tool_context import get_raw_function_info
@@ -42,7 +43,7 @@ async def test_classifier_rejects_invalid_tool_arguments(arguments: str) -> None
     model = FakeLLM(
         fake_responses=[
             FakeLLMResponse(
-                input="input",
+                input=REQUEST.model_dump_json(exclude_none=True),
                 content="",
                 ttft=0,
                 duration=0,
@@ -54,7 +55,7 @@ async def test_classifier_rejects_invalid_tool_arguments(arguments: str) -> None
             )
         ]
     )
-    with pytest.raises(ValueError):
+    with pytest.raises(ValidationError):
         await _inference.classify(model, REQUEST)
 
 
@@ -119,7 +120,7 @@ async def test_classifier_requires_exactly_one_result_tool(names: list[str]) -> 
     model = FakeLLM(
         fake_responses=[
             FakeLLMResponse(
-                input="input",
+                input=REQUEST.model_dump_json(exclude_none=True),
                 content='{"category":"human"}',
                 ttft=0,
                 duration=0,

@@ -250,6 +250,7 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
         self._menu_atask: asyncio.Task[None] | None = None
         self._finish_atask: asyncio.Task[None] | None = None
         self._tasks: set[asyncio.Task[None]] = set()
+        self._subscriptions: list[tuple[EventEmitter[Any], str, Callable[..., Any]]] = []
         self._timer: asyncio.TimerHandle | None = None
         self._speeches: set[SpeechHandle] = set()
 
@@ -287,29 +288,39 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
                 self._session.conn_options.stt_conn_options,
             ),
         )
-        self._session._amd = self
-        self._session._turn_hooks = self._turn_hooks
-        activity._pause_authorization()
-        self._subscriptions: list[tuple[EventEmitter[Any], str, Callable[..., Any]]] = [
-            (self._session, "user_state_changed", self._on_user_state_changed),
-            (self._session, "user_input_transcribed", self._on_user_input_transcribed),
-            (self._session, "speech_created", self._on_speech_created),
-            (self._session, "agent_state_changed", self._on_agent_state_changed),
-            (self._session, "agent_false_interruption", self._on_false_interruption),
-        ]
-        if self._session._room_io:
-            room = self._session._room_io.room
-            self._subscriptions.append((room, "participant_disconnected", self._on_disconnected))
-            if is_given(self._participant_identity):
-                self._session._room_io.set_participant(self._participant_identity)
-        for emitter, event, handler in self._subscriptions:
-            emitter.on(event, handler)
-        self._spawn(self._setup_listening())
+        try:
+            self._session._amd = self
+            self._session._turn_hooks = self._turn_hooks
+            activity._pause_authorization()
+            self._subscriptions = [
+                (self._session, "user_state_changed", self._on_user_state_changed),
+                (self._session, "user_input_transcribed", self._on_user_input_transcribed),
+                (self._session, "speech_created", self._on_speech_created),
+                (self._session, "agent_state_changed", self._on_agent_state_changed),
+                (self._session, "agent_false_interruption", self._on_false_interruption),
+            ]
+            if self._session._room_io:
+                room = self._session._room_io.room
+                self._subscriptions.append(
+                    (room, "participant_disconnected", self._on_disconnected)
+                )
+                if is_given(self._participant_identity):
+                    self._session._room_io.set_participant(self._participant_identity)
+            for emitter, event, handler in self._subscriptions:
+                emitter.on(event, handler)
+            self._spawn(self._setup_listening())
+        except BaseException:
+            await self.aclose()
+            raise
         return self
 
     def _spawn(self, coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
         """Run a background task that cleanup cancels and that ends the run if it fails."""
-        task = asyncio.create_task(coro)
+        try:
+            task = asyncio.create_task(coro)
+        except BaseException:
+            coro.close()
+            raise
         self._tasks.add(task)
         task.add_done_callback(self._on_task_done)
         return task

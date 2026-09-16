@@ -503,7 +503,9 @@ class SessionHost:
                     new_state=new_pb,
                 )
             ),
-            created_at=event.created_at,
+            created_at=(
+                event.speech_timestamp if event.speech_timestamp is not None else event.created_at
+            ),
         )
 
     def _on_user_input_transcribed(self, event: UserInputTranscribedEvent) -> None:
