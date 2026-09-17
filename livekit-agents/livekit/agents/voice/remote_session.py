@@ -504,6 +504,7 @@ class SessionHost:
                     new_state=new_pb,
                 )
             ),
+            # NOTE: backward compat change: it was using backdated created_at before
             created_at=(
                 event.speech_timestamp if event.speech_timestamp is not None else event.created_at
             ),

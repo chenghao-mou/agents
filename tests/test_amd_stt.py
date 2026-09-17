@@ -11,7 +11,7 @@ import pytest
 
 from livekit import rtc
 from livekit.agents.types import APIConnectOptions
-from livekit.agents.voice.amd._transcription import AMDRacingSTT
+from livekit.agents.voice.amd._stt import AMDRacingSTT
 
 from .fake_stt import DrainingStream, DrainingSTT
 

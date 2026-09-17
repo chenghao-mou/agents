@@ -96,10 +96,12 @@ If the AMD stream fails, the open turn uses its buffered session transcript, eve
 it is empty. Subsequent turns also use the session transcript. The sources are never
 combined, and committed turns stay unchanged.
 
-History holds the last 20 committed turns. Late transcripts become part of the next
-committed turn. They do not change an in-flight request or a reply that already started.
+Each classification uses up to 20 recent chat items, including tool calls and results.
+Late transcripts become part of the next committed turn. They do not change an
+in-flight request or a reply that already started.
 A new turn can cancel classification work without discarding its transcript.
-The next request includes that transcript, source, and DTMF digits in its history.
+AMD keeps its selected transcripts in an independent chat context. The next request
+includes those transcripts and successful DTMF tool calls and results.
 An empty EOT keeps useful pending classification for the latest turn. Older AMD
 reply waits exit immediately. Reusing a prediction does not emit another event.
 
@@ -158,13 +160,12 @@ retried on a later voicemail turn. An attempt still playing blocks another messa
 
 ## DTMF and menus
 
-The built-in `send_dtmf_events` tool reports successful local sends to AMD.
-The next classification includes those digits with the participant history.
-A failed or canceled publish is not reported. DTMF alone neither triggers
-classification nor proves that a person answered.
-
-If a custom tool sends DTMF, call `detector.on_dtmf_event(digit)` after each
-successful publish. Report digits separately if a sequence can fail midway.
+AMD observes the session's `function_tools_executed` event and retains successful
+`send_dtmf_events` calls and results in its own chat context. It does not copy the
+session's transcripts or agent speech. Failed or canceled calls are omitted,
+including sequences that sent some digits before failing. The tool raises
+`ToolError` when a publish fails. Custom DTMF tools are not collected automatically.
+DTMF completion alone neither triggers classification nor proves that a person answered.
 
 Menu extraction runs as separate best-effort work. It never holds a reply.
 Each `amd_menu_observed` event identifies the turn and contains a menu description
@@ -193,9 +194,11 @@ New speech cancels the idle timer. Stage changes do not extend the overall limit
 The overall limit can end AMD during a silence wait. Without speech-end timing,
 the silence wait starts at EOT.
 
-Completion or context exit closes AMD requests, removes listeners and turn
-hooks, and releases pending callers. The application receives the final category
-and reason. Completion does not decide the next call action.
+Finishing AMD immediately clears `session.amd`, removes its listeners and turn
+hooks, and releases session audio and reply authorization. Background cleanup
+then cancels outstanding work and closes owned resources. `execute()` waits for
+that cleanup and returns the final category and reason. Completion does not
+decide the next call action.
 
 ## Run the example
 

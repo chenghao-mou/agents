@@ -85,7 +85,7 @@ def _make_activity() -> AgentActivity:
     activity._started = True
     activity._session = AgentSession(vad=None)
     activity._session._agent_state = "listening"
-    activity._session._amd = MagicMock(_input_audio_allowed=True)
+    activity._session._amd = MagicMock(_blocks_session_audio=False)
     activity._session._turn_hooks = activity._session._amd._turn_hooks
     activity._current_speech = None
     activity._rt_session = MagicMock()
@@ -93,7 +93,9 @@ def _make_activity() -> AgentActivity:
     return activity
 
 
-@pytest.mark.parametrize("lifecycle", list(AMDLifecycle))
+@pytest.mark.parametrize(
+    "lifecycle", [AMDLifecycle.INITIALIZED, AMDLifecycle.PENDING, AMDLifecycle.ACTIVE]
+)
 def test_amd_pre_answer_gate_discards_audio_for_all_consumers(lifecycle: AMDLifecycle) -> None:
     activity = _make_activity()
     amd = AMD(activity._session, llm=None, stt=None)
@@ -109,7 +111,7 @@ def test_amd_pre_answer_gate_discards_audio_for_all_consumers(lifecycle: AMDLife
     else:
         resources.stt.push_audio.assert_not_called()
 
-    if lifecycle is AMDLifecycle.PENDING:
+    if lifecycle in {AMDLifecycle.INITIALIZED, AMDLifecycle.PENDING}:
         activity._audio_recognition._push_audio.assert_not_called()
         activity._rt_session.push_audio.assert_not_called()
     else:

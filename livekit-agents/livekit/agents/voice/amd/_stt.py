@@ -10,7 +10,7 @@ from ... import stt
 from ...log import logger
 from ...types import APIConnectOptions
 from ...utils import aio
-from ._turns import AMDTranscript, AMDTranscriptSource
+from ._chat_context import AMDTranscript, AMDTranscriptSource
 
 
 class AMDTurnTranscriptAccumulator:
@@ -52,7 +52,7 @@ class AMDRacingSTT:
     @property
     def amd_stt_active(self) -> bool:
         """Whether the optional AMD stream can still receive audio."""
-        return self._source != "session"
+        return self._source != "session"  # already implies self._model is not None
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
         if not self.amd_stt_active:

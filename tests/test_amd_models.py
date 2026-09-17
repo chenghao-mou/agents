@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from livekit import rtc
 from livekit.agents import AMD, NOT_GIVEN, Agent, AgentSession, inference, llm, utils
 from livekit.agents.voice.amd import AMDCategory, AMDLifecycle
 from livekit.agents.voice.events import SpeechCreatedEvent
@@ -333,6 +334,74 @@ async def test_owned_model_cleanup_failure_still_detaches_and_releases_turn_hook
         assert (await detector.execute()).reason == "cancelled"
         assert session.amd is None
         assert session._activity._authorization_allowed.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("category", [AMDCategory.HUMAN, AMDCategory.MACHINE_UNAVAILABLE])
+async def test_finish_detaches_before_task_cleanup_and_preserves_a_new_run(
+    monkeypatch: pytest.MonkeyPatch, category: AMDCategory
+) -> None:
+    async with running() as (detector, session, classifier, _):
+        activity = session._activity
+        assert activity is not None
+        started = asyncio.Event()
+        cancelling = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_cancellation() -> None:
+            started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelling.set()
+                await release.wait()
+
+        detector._spawn(slow_cancellation())
+        await started.wait()
+        terminal_session_state = []
+        detector.on(
+            "amd_prediction",
+            lambda _: terminal_session_state.append(
+                (session.amd, session._turn_hooks, activity._authorization_allowed.is_set())
+            ),
+        )
+        try:
+            await commit(detector, session, classifier)
+            classifier.prediction(1, category)
+            await asyncio.wait_for(cancelling.wait(), 2)
+            assert terminal_session_state == [(None, None, True)]
+            assert not detector._resources.completion.done()
+
+            session_audio = Mock()
+            amd_audio = Mock(wraps=detector.push_audio)
+            monkeypatch.setattr(activity._audio_recognition, "_push_audio", session_audio)
+            monkeypatch.setattr(detector, "push_audio", amd_audio)
+            frame = rtc.AudioFrame.create(16000, 1, 320)
+            activity.push_audio(frame)
+            session_audio.assert_called_once_with(frame, stt_frame=None)
+            amd_audio.assert_not_called()
+
+            following = AMD(session, llm=ClassifierLLM(), stt=None)
+
+            async def wait_to_listen() -> None:
+                await asyncio.Future()
+
+            monkeypatch.setattr(following, "_setup_listening", wait_to_listen)
+            async with following:
+                assert following.lifecycle is AMDLifecycle.PENDING
+                cancel_pending = Mock(wraps=activity._cancel_pending_speeches)
+                cancel_preemptive = Mock(wraps=activity._cancel_preemptive_generation)
+                monkeypatch.setattr(activity, "_cancel_pending_speeches", cancel_pending)
+                monkeypatch.setattr(activity, "_cancel_preemptive_generation", cancel_preemptive)
+                release.set()
+                assert (await asyncio.wait_for(detector.execute(), 2)).category == category
+                assert session.amd is following
+                assert session._turn_hooks is following._turn_hooks
+                assert not activity._authorization_allowed.is_set()
+                cancel_pending.assert_not_called()
+                cancel_preemptive.assert_not_called()
+        finally:
+            release.set()
 
 
 @pytest.mark.asyncio

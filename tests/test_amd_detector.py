@@ -39,7 +39,7 @@ from livekit.agents.voice.audio_recognition import (
     _EndOfTurnMetrics,
     _PreemptiveGenerationInfo,
 )
-from livekit.agents.voice.events import UserInputTranscribedEvent
+from livekit.agents.voice.events import FunctionToolsExecutedEvent, UserInputTranscribedEvent
 from livekit.agents.voice.speech_handle import SpeechHandle
 
 from .amd_test_utils import detector_clock  # noqa: F401
@@ -97,11 +97,20 @@ class ClassifierLLM(FakeLLM):
         self.responses: dict[int, asyncio.Future[str]] = {}
 
     def chat(self, **kwargs: Any) -> llm.LLMStream:
-        data = json.loads(kwargs["chat_ctx"].items[-1].text_content)
+        chat_ctx = kwargs["chat_ctx"]
         response = asyncio.get_running_loop().create_future()
-        if "stage" in data:
-            self.responses[data["current_turn"]["turn_id"]] = response
-            self.requests.put_nowait(SimpleNamespace(**data))
+        if chat_ctx.items[0].text_content == _inference.CLASSIFY_PROMPT:
+            data = json.loads(chat_ctx.items[1].text_content)
+            messages = [item for item in chat_ctx.messages() if item.role == "user"]
+            self.responses[messages[-1].extra["turn_id"]] = response
+            self.requests.put_nowait(
+                SimpleNamespace(
+                    **data,
+                    current_turn=messages[-1],
+                    earlier_turns=messages[:-1],
+                    chat_ctx=chat_ctx.copy(),
+                )
+            )
         else:
             self.menu_requests.put_nowait(response)
         return ControlledStream(self, response=response, **kwargs)
@@ -224,6 +233,39 @@ def transcribe(detector: AMD, transcript: str) -> None:
     )
 
 
+def dtmf_executed(
+    session: AgentSession,
+    digits: str,
+    *,
+    is_error: bool = False,
+    name: str = "send_dtmf_events",
+    created_at: float | None = None,
+) -> FunctionToolsExecutedEvent:
+    call = llm.FunctionCall(
+        call_id=utils.shortuuid("dtmf_"),
+        name=name,
+        arguments=json.dumps({"events": list(digits)}),
+        created_at=created_at if created_at is not None else time.time(),
+    )
+    event = FunctionToolsExecutedEvent(
+        function_calls=[call],
+        function_call_outputs=[
+            llm.FunctionCallOutput(
+                call_id=call.call_id,
+                name=name,
+                output="Send failed" if is_error else f"Successfully sent DTMF events: {digits}",
+                is_error=is_error,
+            )
+        ],
+    )
+    session.emit("function_tools_executed", event)
+    return event
+
+
+def dtmf_calls(chat_ctx: llm.ChatContext) -> list[llm.FunctionCall]:
+    return [item for item in chat_ctx.items if isinstance(item, llm.FunctionCall)]
+
+
 async def eventually(predicate: Any) -> None:
     async def wait() -> None:
         while not predicate():
@@ -271,7 +313,7 @@ async def commit(
     else:
         hooks = commit_turn(detector, info)
     request = await classifier.request()
-    assert request.current_turn["turn_id"] == detector._turns.turn_id
+    assert request.current_turn.extra["turn_id"] == detector._turn_id
     return hooks
 
 
@@ -449,7 +491,7 @@ async def test_fallback_prediction_has_the_current_previous_category(reason: str
         detector.on("amd_prediction", events.append)
         await commit(detector, session, classifier)
         classifier.prediction(1, AMDCategory.MACHINE_VM)
-        await asyncio.wait_for(detector._wait_for_prediction(1), 2)
+        await asyncio.wait_for(detector._should_reply(1, llm.ChatContext()), 2)
         first = events[-1]
         assert first.state_changed
 
@@ -459,8 +501,8 @@ async def test_fallback_prediction_has_the_current_previous_category(reason: str
             await commit(detector, session, classifier)
             if reason == "inference_error":
                 classifier.respond(2, "invalid JSON")
-        await asyncio.wait_for(detector._wait_for_prediction(2), 2)
-        fallback = detector._turns.prediction(2)
+        await asyncio.wait_for(detector._should_reply(2, llm.ChatContext()), 2)
+        fallback = detector._turns[2].prediction
         assert fallback is not None
         assert len(events) == (1 if reason == "reused" else 2)
         assert fallback.reason == reason
@@ -479,14 +521,14 @@ async def test_customer_hook_and_prediction_overlap_controls_are_temporary() -> 
         info = end_of_turn()
         info.metrics.end_of_turn_delay = 0.5
         session._activity.on_end_of_turn(info)
-        assert detector._turns.turn_id == 1
+        assert detector._turn_id == 1
         assert not agent.hook_started.is_set()
         request = await classifier.request()
         await agent.hook_started.wait()
-        assert request.current_turn["turn_id"] == 1
-        assert request.current_turn["transcript"]["transcript"] == "hello"
+        assert request.current_turn.extra["turn_id"] == 1
+        assert request.current_turn.text_content == "hello"
         classifier.prediction(1, AMDCategory.MACHINE_SCREENING)
-        await eventually(lambda: detector._turns.prediction(1) is not None)
+        await eventually(lambda: detector._turns[1].prediction is not None)
         assert model.calls.empty()
         agent.hook_release.set()
         call = await asyncio.wait_for(model.calls.get(), 2)
@@ -523,12 +565,12 @@ async def test_turn_hooks_keep_their_turn_while_an_older_hook_is_blocked(
             await commit(detector, session, classifier, reply=True)
             await asyncio.wait_for(agent.hook_started.wait(), 2)
             classifier.prediction(1, AMDCategory.MACHINE_SCREENING)
-            await eventually(lambda: detector._turns.prediction(1) is not None)
+            await eventually(lambda: detector._turns[1].prediction is not None)
 
             activity.on_end_of_turn(end_of_turn("Can you hear me?"))
-            assert (await classifier.request()).current_turn["turn_id"] == 2
+            assert (await classifier.request()).current_turn.extra["turn_id"] == 2
             classifier.prediction(2, category)
-            await eventually(lambda: detector._turns.prediction(2) is not None)
+            await eventually(lambda: detector._turns[2].prediction is not None)
             if category == AMDCategory.HUMAN:
                 await asyncio.wait_for(detector.execute(), 2)
                 assert session.amd is None
@@ -565,7 +607,7 @@ async def test_turn_ids_are_local_to_each_amd_run() -> None:
             ) as detector:
                 await eventually(lambda: detector.lifecycle is AMDLifecycle.ACTIVE)
                 hooks = await commit(detector, session, classifier)
-                assert detector._turns.turn_id == 1
+                assert detector._turn_id == 1
                 classifier.prediction(1, AMDCategory.MACHINE_SCREENING)
                 assert await hooks.should_reply(llm.ChatContext())
     finally:
@@ -612,7 +654,7 @@ async def test_voicemail_sends_one_delivered_message_and_records_playback() -> N
         await eventually(lambda: detector._voicemail_message_played)
         await commit(detector, session, classifier, reply=True)
         classifier.prediction(2, AMDCategory.MACHINE_VM)
-        await eventually(lambda: detector._turns.prediction(2) is not None)
+        await eventually(lambda: detector._turns[2].prediction is not None)
         await session._activity._user_turn_completed_atask
         assert model.calls.empty()
         assert detector.lifecycle is AMDLifecycle.ACTIVE
@@ -639,7 +681,7 @@ async def test_superseded_voicemail_reply_does_not_consume_the_stage_message() -
         await commit(detector, session, classifier, reply=True)
         first_turn_task = activity._user_turn_completed_atask
         classifier.prediction(1, AMDCategory.MACHINE_VM)
-        assert (await classifier.request()).current_turn["turn_id"] == 2
+        assert (await classifier.request()).current_turn.extra["turn_id"] == 2
         await asyncio.wait_for(first_turn_task, 2)
         assert len(speeches) == 1
         assert speeches[0].interrupted
@@ -949,7 +991,7 @@ async def test_human_takeover_updates_the_reply_context_during_machine_speech(
         activity.on_end_of_turn(end_of_turn("Thank you."))
         normal = await asyncio.wait_for(model.calls.get(), 2)
         assert not any(m.id.startswith(detector._control_prefix) for m in normal["chat_ctx"].items)
-        assert detector._turns.turn_id == 2
+        assert detector._turn_id == 2
 
 
 @pytest.mark.asyncio
@@ -969,7 +1011,7 @@ async def test_human_instructions_are_skipped_without_a_machine_stage(
             assert await hooks.should_reply(llm.ChatContext())
 
         await commit(detector, session, classifier, reply=True)
-        classifier.prediction(detector._turns.turn_id, AMDCategory.HUMAN)
+        classifier.prediction(detector._turn_id, AMDCategory.HUMAN)
         call = await asyncio.wait_for(model.calls.get(), 2)
         messages = [m for m in call["chat_ctx"].items if m.type == "message"]
         assert not any(m.id.startswith(detector._control_prefix) for m in messages)
@@ -1047,7 +1089,7 @@ async def test_late_unavailable_does_not_cancel_reply(
     async with running(inference_timeout=0.02) as (detector, session, classifier, model):
         await commit(detector, session, classifier)
         classifier.prediction(1, AMDCategory.MACHINE_SCREENING)
-        await detector._wait_for_prediction(1)
+        await detector._should_reply(1, llm.ChatContext())
 
         activity = session._activity
         assert activity is not None
@@ -1095,21 +1137,21 @@ async def test_cancelled_execute_waiter_does_not_cancel_detection() -> None:
 async def test_cancelled_reply_waiter_does_not_block_other_turns() -> None:
     async with running() as (detector, session, classifier, _):
         await commit(detector, session, classifier)
-        cancelled = asyncio.create_task(detector._wait_for_prediction(1))
-        surviving = asyncio.create_task(detector._wait_for_prediction(1))
+        cancelled = asyncio.create_task(detector._should_reply(1, llm.ChatContext()))
+        surviving = asyncio.create_task(detector._should_reply(1, llm.ChatContext()))
         await asyncio.sleep(0)
         cancelled.cancel()
         with pytest.raises(asyncio.CancelledError):
             await cancelled
 
         await commit(detector, session, classifier)
-        current = asyncio.create_task(detector._wait_for_prediction(2))
+        current = asyncio.create_task(detector._should_reply(2, llm.ChatContext()))
         await asyncio.wait_for(surviving, 2)
-        assert detector._turns.prediction(1) is None
+        assert detector._turns[1].prediction is None
         assert not current.done()
         classifier.prediction(2, AMDCategory.HUMAN)
         await asyncio.wait_for(current, 2)
-        assert detector._turns.prediction(2).category == AMDCategory.HUMAN
+        assert detector._turns[2].prediction.category == AMDCategory.HUMAN
 
 
 @pytest.mark.asyncio
@@ -1124,7 +1166,7 @@ async def test_nonterminal_finish_releases_a_waiter_without_a_prediction(reason:
         events = []
         detector.on("amd_prediction", events.append)
         await commit(detector, session, classifier)
-        waiter = asyncio.create_task(detector._wait_for_prediction(1))
+        waiter = asyncio.create_task(detector._should_reply(1, llm.ChatContext()))
         await asyncio.sleep(0)
         assert not waiter.done()
         if reason == "cancelled":
@@ -1136,7 +1178,7 @@ async def test_nonterminal_finish_releases_a_waiter_without_a_prediction(reason:
         assert result.reason == reason
         assert result.category == AMDCategory.UNCERTAIN
         await asyncio.wait_for(waiter, 2)
-        assert detector._turns.prediction(1) is None
+        assert detector._turns[1].prediction is None
         assert events == []
         assert detector._next_deadline is None
 
@@ -1146,7 +1188,7 @@ async def test_empty_turn_does_not_cancel_a_pending_terminal_prediction() -> Non
     async with running() as (detector, session, classifier, _):
         await commit(detector, session, classifier)
         commit_turn(detector, end_of_turn(""))
-        assert detector._turns.prediction(2) is None
+        assert detector._turns[2].prediction is None
         classifier.prediction(1, AMDCategory.HUMAN)
         result = await asyncio.wait_for(detector.execute(), 2)
         assert result.turn_id == 1
@@ -1189,7 +1231,7 @@ async def test_invalid_model_output_falls_back_and_releases_the_reply() -> None:
         hooks = await commit(detector, session, classifier)
         classifier.respond(1, "not JSON")
         assert await hooks.should_reply(llm.ChatContext())
-        assert detector._turns.prediction(1).reason == "inference_error"
+        assert detector._turns[1].prediction.reason == "inference_error"
         assert detector._state == AMDCategory.UNCERTAIN
         assert detector.lifecycle is AMDLifecycle.ACTIVE
         assert detector._next_deadline is not None
@@ -1247,7 +1289,7 @@ async def test_three_uncertain_predictions_complete_detection() -> None:
             await commit(detector, session, classifier)
             classifier.prediction(turn_id, AMDCategory.UNCERTAIN)
             await eventually(
-                lambda expected=turn_id: detector._turns.prediction(expected) is not None
+                lambda expected=turn_id: detector._turns[expected].prediction is not None
             )
         assert (await detector.execute()).reason == "max_uncertain_turns"
 
@@ -1261,7 +1303,7 @@ async def test_inference_timeout_limit_completes_detection(limit: int | None) ->
         for turn_id in range(1, expected_limit + 1):
             await commit(detector, session, classifier)
             await eventually(
-                lambda expected=turn_id: detector._turns.prediction(expected) is not None
+                lambda expected=turn_id: detector._turns[expected].prediction is not None
             )
             assert (detector.lifecycle is AMDLifecycle.ACTIVE) == (turn_id < expected_limit)
         assert (await detector.execute()).reason == "inference_timeout"
@@ -1361,40 +1403,52 @@ async def test_session_close_completes_amd_and_releases_resources() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dtmf_digits_are_ordered_and_included_once_with_the_next_eot() -> None:
-    async with running() as (detector, _, classifier, _):
-        detector.on_dtmf_event("1")
-        detector.on_dtmf_event("2#")
+async def test_dtmf_results_are_collected_once_without_changing_inflight_requests() -> None:
+    async with running() as (detector, session, classifier, _):
+        first_send = dtmf_executed(session, "12#")
+        session.emit("function_tools_executed", first_send)
         assert classifier.requests.empty()
         assert detector._state == AMDCategory.UNCERTAIN
-        assert detector._turns.turn_id == 0
+        assert detector._turn_id == 0
 
         commit_turn(detector, end_of_turn())
-        detector.on_dtmf_event("3")
+        second_send = dtmf_executed(session, "3")
         first = await classifier.request()
-        assert first.current_turn["dtmf_digits"] == "12#"
+        assert dtmf_calls(first.chat_ctx) == first_send.function_calls
         commit_turn(detector, end_of_turn())
         second = await classifier.request()
-        assert second.current_turn["dtmf_digits"] == "3"
-        commit_turn(detector, end_of_turn())
-        assert (await classifier.request()).current_turn["dtmf_digits"] == ""
+        assert dtmf_calls(second.chat_ctx) == (
+            first_send.function_calls + second_send.function_calls
+        )
+        assert dtmf_calls(first.chat_ctx) == first_send.function_calls
+        assert [item.type for item in second.chat_ctx.items[2:]] == [
+            "function_call",
+            "function_call_output",
+            "message",
+            "function_call",
+            "function_call_output",
+            "message",
+        ]
 
 
 @pytest.mark.asyncio
-async def test_dtmf_notification_rejects_invalid_digits_and_ignores_completed_runs() -> None:
-    async with running() as (detector, _, classifier, _):
-        detector.on_dtmf_event("1")
-        for digits in ("", "x", "1 2", "1\n"):
-            with pytest.raises(ValueError, match="digits must contain only"):
-                detector.on_dtmf_event(digits)
+async def test_amd_collects_only_successful_dtmf_calls_from_its_run() -> None:
+    async with running() as (detector, session, classifier, _):
+        session.history.add_message(role="user", content="unrelated session transcript")
+        session.history.add_message(role="assistant", content="agent response")
+        dtmf_executed(session, "1", is_error=True)
+        dtmf_executed(session, "2", name="another_tool")
+        dtmf_executed(session, "3", created_at=detector._started_at - 1)
+        success = dtmf_executed(session, "4")
         commit_turn(detector, end_of_turn())
-        assert (await classifier.request()).current_turn["dtmf_digits"] == "1"
-
-        detector.on_dtmf_event("2")
+        request = await classifier.request()
+        assert dtmf_calls(request.chat_ctx) == success.function_calls
+        assert request.current_turn.text_content == "hello"
+        assert request.earlier_turns == []
         classifier.prediction(1, AMDCategory.HUMAN)
         await detector.execute()
-        detector.on_dtmf_event("3")
-        assert detector._turns._pending_dtmf_digits == ""
+        dtmf_executed(session, "5")
+        assert dtmf_calls(detector._chat_ctx) == success.function_calls
 
 
 @pytest.mark.asyncio
@@ -1404,7 +1458,6 @@ async def test_dtmf_tool_works_without_amd() -> None:
 
     publisher = AsyncMock()
     tool_session = SimpleNamespace(
-        amd=None,
         room_io=SimpleNamespace(
             room=SimpleNamespace(local_participant=SimpleNamespace(publish_dtmf=publisher))
         ),
@@ -1415,29 +1468,55 @@ async def test_dtmf_tool_works_without_amd() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dtmf_tool_reports_successful_prefix_when_a_later_digit_fails() -> None:
-    from livekit.agents.beta.tools.send_dtmf import send_dtmf_events
-    from livekit.agents.beta.workflows.utils import DtmfEvent
+@pytest.mark.parametrize("failure", [None, "error", "cancelled"])
+async def test_amd_observes_dtmf_tool_completion_from_session(
+    monkeypatch: pytest.MonkeyPatch, failure: str | None
+) -> None:
+    from livekit.agents.beta.tools import send_dtmf
 
-    async with running() as (detector, session, classifier, _):
-        publisher = AsyncMock(side_effect=[None, RuntimeError("publish failed")])
-        tool_session = SimpleNamespace(
-            amd=detector,
-            room_io=SimpleNamespace(
-                room=SimpleNamespace(local_participant=SimpleNamespace(publish_dtmf=publisher))
-            ),
+    publisher = AsyncMock(
+        side_effect=[None, RuntimeError("publish failed")]
+        if failure == "error"
+        else [None, asyncio.CancelledError()]
+        if failure == "cancelled"
+        else None
+    )
+    room = SimpleNamespace(local_participant=SimpleNamespace(publish_dtmf=publisher))
+    monkeypatch.setattr(send_dtmf, "get_job_context", lambda: SimpleNamespace(room=room))
+    async with running() as (detector, session, classifier, reply_model):
+        executed = []
+        session.on("function_tools_executed", executed.append)
+        reply_model.fake_response_map[_DEFAULT_IVR_INSTRUCTIONS] = FakeLLMResponse(
+            input=_DEFAULT_IVR_INSTRUCTIONS,
+            content="",
+            ttft=0,
+            duration=0,
+            tool_calls=[
+                llm.FunctionToolCall(
+                    name="send_dtmf_events", arguments='{"events":["1","2"]}', call_id="dtmf"
+                )
+            ],
         )
-        result = await send_dtmf_events(
-            SimpleNamespace(session=tool_session), [DtmfEvent.ONE, DtmfEvent.TWO]
-        )
-        assert result.startswith("Failed to send DTMF event: 2.")
+        await commit(detector, session, classifier, reply=True)
+        classifier.prediction(1, AMDCategory.MACHINE_IVR)
+        await eventually(lambda: bool(executed))
         assert publisher.await_count == 2
-        commit_turn(detector, end_of_turn())
-        assert (await classifier.request()).current_turn["dtmf_digits"] == "1"
+        output = executed[0].function_call_outputs[0]
+        assert output.is_error == (failure == "error")
+        if failure == "cancelled":
+            assert not output.output
+        if failure == "error":
+            assert "Failed to send DTMF event: 2." in output.output
+        commit_turn(detector, end_of_turn("Connecting you."))
+        request = await classifier.request()
+        calls = dtmf_calls(request.chat_ctx)
+        assert calls == ([] if failure else executed[0].function_calls)
+        if not failure:
+            assert output in request.chat_ctx.items
 
 
 @pytest.mark.asyncio
-async def test_dtmf_tool_does_not_report_an_incomplete_publish() -> None:
+async def test_dtmf_tool_propagates_cancelled_publish() -> None:
     from livekit.agents.beta.tools.send_dtmf import send_dtmf_events
     from livekit.agents.beta.workflows.utils import DtmfEvent
 
@@ -1447,9 +1526,7 @@ async def test_dtmf_tool_does_not_report_an_incomplete_publish() -> None:
         started.set()
         await asyncio.Future()
 
-    detector = SimpleNamespace(on_dtmf_event=Mock())
     tool_session = SimpleNamespace(
-        amd=detector,
         room_io=SimpleNamespace(
             room=SimpleNamespace(local_participant=SimpleNamespace(publish_dtmf=publish))
         ),
@@ -1461,27 +1538,6 @@ async def test_dtmf_tool_does_not_report_an_incomplete_publish() -> None:
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    detector.on_dtmf_event.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_dtmf_tool_does_not_attach_an_old_send_to_a_new_amd_run() -> None:
-    from livekit.agents.beta.tools.send_dtmf import send_dtmf_events
-    from livekit.agents.beta.workflows.utils import DtmfEvent
-
-    old = SimpleNamespace(on_dtmf_event=Mock())
-    new = SimpleNamespace(on_dtmf_event=Mock())
-    tool_session = SimpleNamespace(amd=old)
-
-    async def publish(**kwargs: Any) -> None:
-        tool_session.amd = new
-
-    tool_session.room_io = SimpleNamespace(
-        room=SimpleNamespace(local_participant=SimpleNamespace(publish_dtmf=publish))
-    )
-    await send_dtmf_events(SimpleNamespace(session=tool_session), [DtmfEvent.ONE])
-    old.on_dtmf_event.assert_not_called()
-    new.on_dtmf_event.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1510,10 +1566,10 @@ async def test_first_final_wins_for_amd_without_changing_agent_transcript(winner
         info = end_of_turn("session transcript")
         session._activity.on_end_of_turn(info)
         request = await classifier.request()
-        assert request.current_turn["transcript"]["transcript"] == (
+        assert request.current_turn.text_content == (
             f"{winner if winner == 'session' else 'AMD'} transcript"
         )
-        assert request.current_turn["transcript"]["source"] == winner
+        assert request.current_turn.extra["transcript_source"] == winner
         assert not stream.flushed.is_set()
         classifier.prediction(1, AMDCategory.UNCERTAIN)
         reply = await asyncio.wait_for(reply_model.calls.get(), 2)
@@ -1535,7 +1591,7 @@ async def test_transcript_received_after_eot_is_kept_in_next_request() -> None:
     async with running(stt=stt) as (detector, _, classifier, _):
         stream = push_audio(detector, stt)
         commit_turn(detector, end_of_turn(""))
-        assert detector._turns.prediction(1).transcript == ""
+        assert detector._turns[1].prediction.transcript == ""
         stream.send_fake_transcript("Please state your name.")
         await eventually(
             lambda: (
@@ -1546,19 +1602,15 @@ async def test_transcript_received_after_eot_is_kept_in_next_request() -> None:
             )
         )
         assert classifier.requests.empty()
-        assert detector._turns.prediction(1).transcript == ""
+        assert detector._turns[1].prediction.transcript == ""
 
         commit_turn(detector, end_of_turn(""))
         first = await classifier.request()
-        assert first.current_turn["turn_id"] == 2
+        assert first.current_turn.extra["turn_id"] == 2
         classifier.prediction(2, AMDCategory.MACHINE_SCREENING)
-        await asyncio.wait_for(detector._wait_for_prediction(2), 2)
-        prediction = detector._turns.prediction(2)
-        assert (
-            prediction.transcript
-            == first.current_turn["transcript"]["transcript"]
-            == "Please state your name."
-        )
+        await asyncio.wait_for(detector._should_reply(2, llm.ChatContext()), 2)
+        prediction = detector._turns[2].prediction
+        assert prediction.transcript == first.current_turn.text_content == "Please state your name."
 
         stream.send_fake_transcript("Okay, connecting you.")
         await eventually(
@@ -1571,17 +1623,14 @@ async def test_transcript_received_after_eot_is_kept_in_next_request() -> None:
         )
         commit_turn(detector, end_of_turn("Okay."))
         second = await classifier.request()
-        assert second.current_turn["turn_id"] == 3
-        assert second.current_turn["transcript"]["transcript"] == "Okay, connecting you."
-        assert second.current_turn["transcript"]["source"] == "amd"
-        assert second.earlier_turns[0]["transcript"]["transcript"] == ""
+        assert second.current_turn.extra["turn_id"] == 3
+        assert second.current_turn.text_content == "Okay, connecting you."
+        assert second.current_turn.extra["transcript_source"] == "amd"
+        assert second.earlier_turns[0].text_content == ""
+        assert second.earlier_turns[1].text_content == first.current_turn.text_content
         assert (
-            second.earlier_turns[1]["transcript"]["transcript"]
-            == first.current_turn["transcript"]["transcript"]
-        )
-        assert (
-            second.earlier_turns[1]["transcript"]["source"]
-            == first.current_turn["transcript"]["source"]
+            second.earlier_turns[1].extra["transcript_source"]
+            == first.current_turn.extra["transcript_source"]
             == "amd"
         )
 
@@ -1591,12 +1640,12 @@ async def test_late_final_after_many_empty_turns_is_committed_at_the_next_eot() 
     stt = DrainingSTT()
     async with running(stt=stt) as (detector, _, classifier, _):
         stream = push_audio(detector, stt)
-        detector.on_dtmf_event("1")
+        dtmf_executed(detector._session, "1")
         commit_turn(detector, end_of_turn(""))
         for _ in range(20):
             commit_turn(detector, end_of_turn(""))
-        assert detector._turns.turn_id == 21
-        assert all(detector._turns.prediction(turn_id) is not None for turn_id in range(1, 22))
+        assert detector._turn_id == 21
+        assert all(detector._turns[turn_id].prediction is not None for turn_id in range(1, 22))
         stream.send_fake_transcript("Hello, can you hear me?")
         await eventually(
             lambda: (
@@ -1609,10 +1658,10 @@ async def test_late_final_after_many_empty_turns_is_committed_at_the_next_eot() 
         assert classifier.requests.empty()
         commit_turn(detector, end_of_turn(""))
         request = await classifier.request()
-        assert request.current_turn["turn_id"] == 22
-        assert request.current_turn["transcript"]["transcript"] == "Hello, can you hear me?"
-        assert request.current_turn["dtmf_digits"] == ""
-        assert [turn["turn_id"] for turn in request.earlier_turns] == list(range(3, 22))
+        assert request.current_turn.extra["turn_id"] == 22
+        assert request.current_turn.text_content == "Hello, can you hear me?"
+        assert not dtmf_calls(request.chat_ctx)
+        assert [turn.extra["turn_id"] for turn in request.earlier_turns] == list(range(3, 22))
         classifier.prediction(22, AMDCategory.HUMAN)
         assert (await detector.execute()).category == AMDCategory.HUMAN
 
@@ -1620,32 +1669,32 @@ async def test_late_final_after_many_empty_turns_is_committed_at_the_next_eot() 
 @pytest.mark.asyncio
 async def test_superseded_inference_keeps_the_classification_context() -> None:
     async with running() as (detector, _, classifier, _):
-        detector.on_dtmf_event("1")
+        dtmf_executed(detector._session, "1")
         commit_turn(detector, end_of_turn("Hello, can you hear me?"))
         previous = await classifier.request()
         hooks = commit_turn(detector, end_of_turn("Yes, let's schedule that."))
         request = await classifier.request()
         assert request.earlier_turns == [previous.current_turn]
-        assert request.earlier_turns[0] == {
-            "turn_id": 1,
-            "transcript": {"transcript": "Hello, can you hear me?", "source": "session"},
-            "dtmf_digits": "1",
-        }
-        assert request.current_turn["transcript"]["transcript"] == "Yes, let's schedule that."
+        assert request.earlier_turns[0].text_content == "Hello, can you hear me?"
+        assert request.earlier_turns[0].extra == {"turn_id": 1, "transcript_source": "session"}
+        assert [json.loads(call.arguments) for call in dtmf_calls(request.chat_ctx)] == [
+            {"events": ["1"]}
+        ]
+        assert request.current_turn.text_content == "Yes, let's schedule that."
         assert request.stage == previous.stage == "uncertain"
-        assert detector._turns.prediction(1) is None
+        assert detector._turns[1].prediction is None
         assert classifier.responses[1].cancelled()
         classifier.prediction(2, AMDCategory.HUMAN)
         assert await hooks.should_reply(llm.ChatContext())
-        assert (await detector.execute()).transcript == request.current_turn["transcript"][
-            "transcript"
-        ]
+        assert (await detector.execute()).transcript == request.current_turn.text_content
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failed", [False, True])
-async def test_empty_turns_do_not_cancel_or_count_against_pending_inference(failed: bool) -> None:
-    async with running(inference_timeout=10, max_uncertain_turns=2) as (
+@pytest.mark.parametrize("reason", ["prediction", "inference_error", "inference_timeout"])
+async def test_empty_turns_do_not_cancel_or_count_against_pending_inference(reason: str) -> None:
+    async with running(
+        inference_timeout=0.1 if reason == "inference_timeout" else 10, max_uncertain_turns=2
+    ) as (
         detector,
         session,
         classifier,
@@ -1665,22 +1714,23 @@ async def test_empty_turns_do_not_cancel_or_count_against_pending_inference(fail
         current_wait = asyncio.create_task(current.should_reply(llm.ChatContext()))
         await asyncio.sleep(0)
         assert not current_wait.done()
-        assert detector._turns.prediction(1) is None
+        assert detector._turns[1].prediction is None
         assert not classifier.responses[1].done()
-        assert detector._turns.prediction(2) is None
-        classifier.respond(1, "invalid" if failed else '{"category":"uncertain"}')
+        assert detector._turns[2].prediction is None
+        if reason != "inference_timeout":
+            classifier.respond(
+                1, "invalid" if reason == "inference_error" else '{"category":"uncertain"}'
+            )
         assert await asyncio.wait_for(current_wait, 2)
-        assert detector._turns.prediction(3) is detector._turns.prediction(1)
-        assert detector._turns.prediction(2) is detector._turns.prediction(1)
-        assert [(e.turn_id, e.reason) for e in events] == [
-            (1, "inference_error" if failed else "prediction"),
-        ]
+        assert detector._turns[3].prediction is detector._turns[1].prediction
+        assert detector._turns[2].prediction is detector._turns[1].prediction
+        assert [(e.turn_id, e.reason) for e in events] == [(1, reason)]
         assert classifier.requests.empty()
-        final_turn_id = 5 if failed else 4
+        final_turn_id = 4 if reason == "prediction" else 5
         for turn_id in range(4, final_turn_id + 1):
             await commit(detector, session, classifier)
             classifier.prediction(turn_id, AMDCategory.UNCERTAIN)
-            await asyncio.wait_for(detector._wait_for_prediction(turn_id), 2)
+            await asyncio.wait_for(detector._should_reply(turn_id, llm.ChatContext()), 2)
             assert (detector.lifecycle is AMDLifecycle.ACTIVE) == (turn_id < final_turn_id)
         result = await asyncio.wait_for(detector.execute(), 2)
         assert result.reason == "max_uncertain_turns"
@@ -1690,13 +1740,15 @@ async def test_empty_turns_do_not_cancel_or_count_against_pending_inference(fail
 @pytest.mark.asyncio
 async def test_dtmf_on_an_empty_turn_is_context_not_an_inference_trigger() -> None:
     async with running() as (detector, _, classifier, _):
-        detector.on_dtmf_event("1")
+        dtmf_executed(detector._session, "1")
         commit_turn(detector, end_of_turn(""))
         assert classifier.requests.empty()
         commit_turn(detector, end_of_turn("Hello."))
         request = await classifier.request()
-        assert request.current_turn["dtmf_digits"] == ""
-        assert request.earlier_turns[0]["dtmf_digits"] == "1"
+        assert [json.loads(call.arguments) for call in dtmf_calls(request.chat_ctx)] == [
+            {"events": ["1"]}
+        ]
+        assert request.earlier_turns[0].text_content == ""
 
 
 @pytest.mark.asyncio
@@ -1779,7 +1831,7 @@ async def test_llm_calls_use_session_connection_options(
             hooks = await commit(detector, session, classifier)
             classifier.prediction(1, AMDCategory.MACHINE_SCREENING)
             assert await hooks.should_reply(llm.ChatContext())
-            prediction = detector._turns.prediction(1)
+            prediction = detector._turns[1].prediction
             assert prediction.reason == ("prediction" if succeeds else "inference_error")
             assert prediction.category == (
                 AMDCategory.MACHINE_SCREENING if succeeds else AMDCategory.UNCERTAIN
@@ -1811,16 +1863,16 @@ async def test_prediction_deadline_does_not_wait_for_llm_retries(
         hooks = await commit(detector, session, classifier)
         classifier.prediction(1, AMDCategory.HUMAN)
         assert await hooks.should_reply(llm.ChatContext())
-        fallback = detector._turns.prediction(1)
+        fallback = detector._turns[1].prediction
         assert fallback.reason == "inference_timeout"
         assert attempts == 1
         await asyncio.sleep(0.2)
         assert detector.lifecycle is AMDLifecycle.ACTIVE
         assert detector._state == AMDCategory.UNCERTAIN
         assert attempts == 1
-        assert detector._classifier_task is None
+        assert detector._classifier_atask is None
         assert [event.reason for event in predictions] == ["inference_timeout"]
-        assert detector._turns.prediction(1) == fallback
+        assert detector._turns[1].prediction == fallback
 
 
 @pytest.mark.asyncio
@@ -1911,7 +1963,7 @@ async def test_prediction_listener_next_turn_cancels_the_previous_menu(
         detector.on("amd_prediction", advance_turn)
         await commit(detector, session, classifier)
         classifier.prediction(1, AMDCategory.MACHINE_IVR)
-        assert (await classifier.request()).current_turn["turn_id"] == 2
+        assert (await classifier.request()).current_turn.extra["turn_id"] == 2
         await asyncio.sleep(0.01)
         extract_menu.assert_not_called()
         classifier.prediction(2, AMDCategory.HUMAN)
@@ -1937,8 +1989,8 @@ async def test_delayed_deadline_cancels_reply_hold_without_repeating_effects(
         await commit(detector, session, classifier)
         classifier.prediction(1, AMDCategory.MACHINE_IVR)
         await asyncio.sleep(0.01)
-        assert detector._turns.prediction(1).category == AMDCategory.MACHINE_IVR
-        assert detector._reply_held
+        assert detector._turns[1].prediction.category == AMDCategory.MACHINE_IVR
+        assert detector._reply_held_at(asyncio.get_running_loop().time())
         extract_menu.assert_awaited_once()
         state = detector._state
         loop = asyncio.get_running_loop()
@@ -1981,13 +2033,13 @@ async def test_split_screening_rollover_retains_all_turns() -> None:
         for index, (transcript, category) in enumerate(history, start=1):
             commit_turn(detector, end_of_turn(transcript))
             request = await classifier.request()
-            assert [e["transcript"]["transcript"] for e in request.earlier_turns] == [
+            assert [e.text_content for e in request.earlier_turns] == [
                 prior[0] for prior in history[: index - 1]
             ]
             classifier.prediction(index, category)
-            await eventually(lambda turn_id=index: detector._turns.prediction(turn_id) is not None)
+            await eventually(lambda turn_id=index: detector._turns[turn_id].prediction is not None)
         assert detector._state == AMDCategory.MACHINE_VM
-        assert detector._turns.prediction(4).prev_stage_category == AMDCategory.UNCERTAIN
+        assert detector._turns[4].prediction.prev_stage_category == AMDCategory.UNCERTAIN
 
 
 @pytest.mark.asyncio
@@ -2007,7 +2059,7 @@ async def test_classifier_that_ignores_cancellation_cannot_change_state(
                 result = await asyncio.shield(response)
                 break
             except asyncio.CancelledError:
-                if request.current_turn.turn_id != 1:
+                if request.chat_ctx.messages()[-1].extra["turn_id"] != 1:
                     raise
                 cancelled.set()
         if isinstance(result, Exception):
@@ -2020,7 +2072,7 @@ async def test_classifier_that_ignores_cancellation_cannot_change_state(
         detector.on("amd_prediction", events.append)
         commit_turn(detector, end_of_turn())
         response = await asyncio.wait_for(requests.get(), 2)
-        old_task = detector._classifier_task
+        old_task = detector._classifier_atask
         if cancelled_by == "new_turn":
             hooks = commit_turn(detector, end_of_turn("a new prompt"))
             newer_response = await asyncio.wait_for(requests.get(), 2)
@@ -2042,12 +2094,12 @@ async def test_classifier_that_ignores_cancellation_cannot_change_state(
         assert detector._state == state
         assert events == predictions
         if cancelled_by == "new_turn":
-            assert detector._turns.prediction(1) is None
+            assert detector._turns[1].prediction is None
             newer_response.set_result(_inference.AMDResponse(category=AMDCategory.MACHINE_VM))
             assert await hooks.should_reply(llm.ChatContext())
             assert detector._state == AMDCategory.MACHINE_VM
         elif cancelled_by == "timeout":
-            assert detector._turns.prediction(1).reason == "inference_timeout"
+            assert detector._turns[1].prediction.reason == "inference_timeout"
         else:
             assert (await detector.execute()).reason == "cancelled"
 
@@ -2062,7 +2114,7 @@ async def test_result_after_deadline_is_ignored_before_timer_callback(
         events = []
         detector.on("amd_prediction", events.append)
         hooks = await commit(detector, session, classifier)
-        task = detector._classifier_task
+        task = detector._classifier_atask
         loop = asyncio.get_running_loop()
         with monkeypatch.context() as delayed_clock:
             delayed_clock.setattr(detector_module.time, "monotonic", lambda: loop.time() + 2)
@@ -2086,7 +2138,7 @@ async def test_prediction_listener_cannot_mutate_saved_decision() -> None:
         hooks = await commit(detector, session, classifier)
         classifier.prediction(1, AMDCategory.MACHINE_VM)
         assert await hooks.should_reply(llm.ChatContext())
-        prediction = detector._turns.prediction(1)
+        prediction = detector._turns[1].prediction
         assert prediction.category == AMDCategory.MACHINE_VM
         assert prediction.transcript == "hello"
         assert detector._state == AMDCategory.MACHINE_VM
@@ -2114,18 +2166,21 @@ async def test_classifier_history_is_bounded_and_saved_decisions_survive() -> No
         commit_turn(detector, end_of_turn("first prompt"))
         await classifier.request()
         classifier.prediction(1, AMDCategory.MACHINE_SCREENING)
-        await detector._wait_for_prediction(1)
-        first_prediction = detector._turns.prediction(1)
+        await detector._should_reply(1, llm.ChatContext())
+        first_prediction = detector._turns[1].prediction
         for _ in range(22):
             commit_turn(detector, end_of_turn(""))
-        detector.on_dtmf_event("2#")
+        dtmf_executed(detector._session, "2#")
         commit_turn(detector, end_of_turn("latest prompt"))
         request = await classifier.request()
-        assert request.current_turn["turn_id"] == 24
-        assert request.current_turn["dtmf_digits"] == "2#"
-        assert [turn["turn_id"] for turn in request.earlier_turns] == list(range(5, 24))
-        assert all(turn["transcript"]["transcript"] == "" for turn in request.earlier_turns)
-        assert detector._turns.prediction(1) is first_prediction
+        assert request.current_turn.extra["turn_id"] == 24
+        assert [json.loads(call.arguments) for call in dtmf_calls(request.chat_ctx)] == [
+            {"events": ["2", "#"]}
+        ]
+        assert [turn.extra["turn_id"] for turn in request.earlier_turns] == list(range(7, 24))
+        assert len(request.chat_ctx.items[2:]) == 20
+        assert all(turn.text_content == "" for turn in request.earlier_turns)
+        assert detector._turns[1].prediction is first_prediction
         assert first_prediction.category == AMDCategory.MACHINE_SCREENING
 
 
@@ -2144,7 +2199,7 @@ async def test_amd_enforces_overall_deadline_independently_of_fsm(pending: str) 
             await commit(detector, session, classifier)
             if pending != "classification":
                 classifier.prediction(1, AMDCategory.MACHINE_VM)
-                await eventually(lambda: detector._reply_held)
+                await eventually(lambda: detector._reply_held_at(asyncio.get_running_loop().time()))
                 if pending == "speech":
                     speech_started(detector)
         state = detector._state
@@ -2158,7 +2213,7 @@ async def test_amd_enforces_overall_deadline_independently_of_fsm(pending: str) 
         )
         assert detector._hard_deadline is None
         assert detector._state is state
-        assert not detector._reply_held
+        assert not detector._reply_held_at(asyncio.get_running_loop().time())
         assert detector._next_deadline is None
         assert detector._timer is None
         assert session.amd is None
@@ -2184,7 +2239,7 @@ async def test_voicemail_delivery_guard_survives_transitions_and_allows_retry(
             turn_id += 1
             await commit(detector, session, classifier)
             classifier.prediction(turn_id, bridge)
-            await detector._wait_for_prediction(turn_id)
+            await detector._should_reply(turn_id, llm.ChatContext())
         turn_id += 1
         overlapping = await commit(detector, session, classifier)
         classifier.prediction(turn_id, AMDCategory.MACHINE_VM)
@@ -2207,7 +2262,7 @@ async def test_voicemail_delivery_guard_survives_transitions_and_allows_retry(
             turn_id += 1
             await commit(detector, session, classifier)
             classifier.prediction(turn_id, bridge)
-            await detector._wait_for_prediction(turn_id)
+            await detector._should_reply(turn_id, llm.ChatContext())
         turn_id += 1
         retry = await commit(detector, session, classifier)
         classifier.prediction(turn_id, AMDCategory.MACHINE_VM)
@@ -2236,7 +2291,7 @@ async def test_fallback_and_reuse_leave_fsm_unchanged(
             if reason == "inference_error":
                 classifier.respond(2, "invalid JSON")
         assert await hooks.should_reply(llm.ChatContext()) == (category is not AMDCategory.WAIT)
-        assert detector._turns.prediction(2).reason == reason
+        assert detector._turns[2].prediction.reason == reason
         assert detector._state is state
         transition.assert_not_called()
 
@@ -2253,8 +2308,8 @@ async def test_valid_prediction_resets_timeout_budget_before_reply_is_allowed() 
         assert detector._inference_timeouts == 1
         await commit(detector, session, classifier)
         classifier.prediction(2, AMDCategory.MACHINE_SCREENING)
-        await eventually(lambda: detector._turns.prediction(2) is not None)
-        assert detector._reply_held
+        await eventually(lambda: detector._turns[2].prediction is not None)
+        assert detector._reply_held_at(asyncio.get_running_loop().time())
         assert detector._inference_timeouts == 0
         third = await commit(detector, session, classifier)
         assert await third.should_reply(llm.ChatContext())
@@ -2302,7 +2357,7 @@ async def test_wait_skips_reply_and_allows_a_fresh_prediction(
         if stage is not None:
             await commit(detector, session, classifier)
             classifier.prediction(1, stage)
-            await detector._wait_for_prediction(1)
+            await detector._should_reply(1, llm.ChatContext())
         previous = detector._state
         predictions = list(events)
         transition = Mock(wraps=_fsm.transition)
@@ -2310,14 +2365,14 @@ async def test_wait_skips_reply_and_allows_a_fresh_prediction(
         activity = session._activity
         activity.on_end_of_turn(end_of_turn("While you wait, hear about our special offers."))
         request = await classifier.request()
-        classifier.prediction(request.current_turn["turn_id"], AMDCategory.WAIT)
+        classifier.prediction(request.current_turn.extra["turn_id"], AMDCategory.WAIT)
         await asyncio.wait_for(activity._user_turn_completed_atask, 0.1)
 
         assert detector._state is AMDCategory.WAIT
         assert detector._previous_stage is previous
         assert events[:-1] == predictions
         assert events[-1].category is AMDCategory.WAIT
-        assert not detector._reply_held
+        assert not detector._reply_held_at(asyncio.get_running_loop().time())
         assert detector._voicemail_turn_id is None
         assert model.calls.empty()
         transition.assert_called_once_with(previous, AMDCategory.WAIT)
@@ -2329,7 +2384,7 @@ async def test_wait_skips_reply_and_allows_a_fresh_prediction(
         following = await classifier.request()
         assert following.stage == AMDCategory.WAIT
         assert set(following.allowed_next_categories) == set(AMDCategory)
-        classifier.prediction(following.current_turn["turn_id"], AMDCategory.UNCERTAIN)
+        classifier.prediction(following.current_turn.extra["turn_id"], AMDCategory.UNCERTAIN)
         await asyncio.wait_for(activity._user_turn_completed_atask, 0.1)
         await asyncio.wait_for(model.calls.get(), 0.1)
         assert transition.call_count == 2
@@ -2342,7 +2397,7 @@ async def test_empty_turns_preserve_wait_until_new_classification(pending: bool)
     async with running() as (detector, session, classifier, _):
         await commit(detector, session, classifier)
         classifier.prediction(1, AMDCategory.MACHINE_IVR)
-        await detector._wait_for_prediction(1)
+        await detector._should_reply(1, llm.ChatContext())
         hooks = await commit(detector, session, classifier)
         if pending:
             hooks = commit_turn(detector, end_of_turn(""))
@@ -2355,7 +2410,7 @@ async def test_empty_turns_preserve_wait_until_new_classification(pending: bool)
         assert detector._state is AMDCategory.WAIT
         assert classifier.requests.empty()
         hooks = await commit(detector, session, classifier)
-        classifier.prediction(detector._turns.turn_id, AMDCategory.HUMAN)
+        classifier.prediction(detector._turn_id, AMDCategory.HUMAN)
         assert await hooks.should_reply(llm.ChatContext())
         assert (await detector.execute()).category is AMDCategory.HUMAN
 

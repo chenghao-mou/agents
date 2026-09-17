@@ -1653,7 +1653,7 @@ class AgentActivity(RecognitionHooks):
         if not self._started:
             return
         amd = self._session._amd
-        if amd is not None and not amd._input_audio_allowed:
+        if amd is not None and amd._blocks_session_audio:
             return
 
         aec_warmup_active: bool = (
@@ -1674,10 +1674,8 @@ class AgentActivity(RecognitionHooks):
 
         # When discarding, substitute silence on the paths that would otherwise
         # see contaminated/echoed audio (STT, realtime model) so the downstream
-        # stream stays continuous. VAD and the interruption detector keep
-        # receiving the real frame so they can still react to the user. AMD also
-        # receives the real frame: a human who talks over the agent's greeting is
-        # the signal AMD must not miss, so it never gets the substituted silence.
+        # stream stays continuous. VAD, AMD and the interruption detector keep
+        # receiving the real frame so they can still react to the user.
         stt_frame: rtc.AudioFrame | None = None
         if should_discard:
             stt_frame = utils.audio.silence_frame_like(frame)
@@ -1883,7 +1881,7 @@ class AgentActivity(RecognitionHooks):
             self._preemptive_generation = None
 
     def _cancel_pending_speeches(self) -> None:
-        """Cancel preemptive, queued, and held speech; preserve active or paused playback."""
+        """cancel all pending speeches or generations, only preserve active or paused playback."""
         self._cancel_preemptive_generation()
         for _, _, speech in self._speech_q:
             speech._cancel()
@@ -3121,7 +3119,7 @@ class AgentActivity(RecognitionHooks):
 
     @property
     def _is_agent_busy(self) -> bool:
-        """Whether turn handling, speech, playback, or interruption recovery is pending."""
+        """whether this is any work for turn handling, speech, playback, or interruption recovery."""
         audio_output = self._session.output.audio
         return (
             not self._no_pending_speech
