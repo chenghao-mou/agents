@@ -584,14 +584,30 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             prev_stage_category=self._previous_stage,
             voicemail_message_played=self._voicemail_message_played,
         )
-        # Empty turns committed during inference share its result.
-        # non-empty turn commit should have cancelled stale ones already
-        for turn_id in range(turn.turn_id, self._turn_id + 1):
-            self._turns[turn_id].prediction = event
-
-        self._latest = event
+        turn.prediction = event
+        if reason is not AMDReason.REUSED:
+            # reused events repeat this one, so completion keeps the classified turn
+            self._latest = event
         if reason is AMDReason.PREDICTION:
             self._previous_turn = event.prev_turn_category
+        # Empty turns committed during inference reuse its result, each with its own event.
+        # A non-empty commit would have cancelled this inference already.
+        events = [event]
+        for turn_id in range(turn.turn_id + 1, self._turn_id + 1):
+            later = self._turns[turn_id]
+            later.prediction = events[-1].model_copy(
+                update={
+                    "turn_id": later.turn_id,
+                    "reason": AMDReason.REUSED,
+                    "state_changed": False,
+                    "transcript": later.transcript.transcript,
+                    "speech_duration": later.speech_duration,
+                    "delay": time.monotonic() - later.committed_at,
+                    "inference_duration": None,
+                    "prev_turn_category": events[-1].category,
+                }
+            )
+            events.append(later.prediction)
 
         # Execute effects before notifying listeners, which may commit the next turn.
         for effect in effects:
@@ -624,7 +640,8 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
                     },
                 )
 
-            _release_prediction(event.model_copy())
+            for released in events:
+                _release_prediction(released.model_copy())
         except Exception:
             logger.exception("amd prediction handler failed")
             self._finish(AMDReason.INTERNAL_ERROR)

@@ -1794,9 +1794,20 @@ async def test_empty_turns_do_not_cancel_or_count_against_pending_inference(reas
                 1, "invalid" if reason == "inference_error" else '{"category":"uncertain"}'
             )
         assert await asyncio.wait_for(current_wait, 2)
-        assert detector._turns[3].prediction is detector._turns[1].prediction
-        assert detector._turns[2].prediction is detector._turns[1].prediction
-        assert [(e.turn_id, e.reason) for e in events] == [(1, reason)]
+        source = detector._turns[1].prediction
+        for turn_id in (2, 3):
+            reused = detector._turns[turn_id].prediction
+            assert reused.turn_id == turn_id
+            assert reused.reason == "reused"
+            assert reused.category == source.category
+            assert reused.stage == source.stage
+            assert reused.transcript == ""
+            assert not reused.state_changed
+        assert [(e.turn_id, e.reason) for e in events] == [
+            (1, reason),
+            (2, "reused"),
+            (3, "reused"),
+        ]
         assert classifier.requests.empty()
         final_turn_id = 4 if reason == "prediction" else 5
         for turn_id in range(4, final_turn_id + 1):

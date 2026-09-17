@@ -469,8 +469,9 @@ async def test_empty_eot_after_resumed_speech_rearms_a_useful_prediction(
         commit_turn(detector, end_of_turn(""))
         if not inference_ready:
             classifier.prediction(1, AMDCategory.MACHINE_SCREENING)
-        # an empty turn committed after the prediction reuses it and emits a reused event
-        expected = [(1, "prediction")] + ([(2, "reused")] if inference_ready else [])
+        # an empty turn reuses the prediction and emits its own reused event,
+        # whether it was committed after the prediction or while it was pending
+        expected = [(1, "prediction"), (2, "reused")]
         await asyncio.sleep(0.9)
         assert [(e.turn_id, e.reason) for e in events] == expected
         assert detector._reply_held_at(asyncio.get_running_loop().time())
