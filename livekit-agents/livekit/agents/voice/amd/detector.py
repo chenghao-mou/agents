@@ -152,8 +152,8 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
     The SDK owns classification and stage control. Models can use any provider.
 
     AMD uses the customer's current Agent. Realtime models require client-side
-    turn detection, session STT, and per-response tool control. Agent handoffs
-    during AMD are not supported. Normal hooks, interruptions,
+    turn detection, session or AMD STT, user transcription, and per-response tool
+    control. Agent handoffs during AMD are not supported. Normal hooks, interruptions,
     playback, and StopResponse stay in AgentSession. Menu events are informational
     and never execute actions.
 
@@ -169,10 +169,12 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             always use the current Agent's LLM. A string selects a LiveKit
             Inference model. Calls use ``session.conn_options.llm_conn_options``.
             Supplied models stay open when AMD completes.
-        stt: Optional second streaming STT model. When omitted, use
+        stt: Optional streaming STT model for AMD. When omitted, use
             ``cartesia/ink-whisper`` if LiveKit Cloud credentials are available;
             otherwise use only the session transcript. Pass None to always use
-            only the session transcript. A string selects a LiveKit Inference model.
+            only the session transcript. With realtime models, AMD uses this STT
+            without racing the session transcript. A string selects a LiveKit
+            Inference model.
         participant_identity: Select the participant before placing an outbound call.
         wait_until_answered: Discard pre-answer audio from AMD and AgentSession
             when True. When False, listen to subscribed SIP early media.
@@ -334,13 +336,15 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             if activity._rt_turn_detection_enabled:
                 raise ValueError("amd requires client-side turn detection with realtime models")
             capabilities = activity.llm.capabilities
+            if not capabilities.user_transcription:
+                raise ValueError("amd requires user transcription with realtime models")
             if capabilities.auto_tool_reply_generation or not capabilities.per_response_tool_choice:
                 raise ValueError(
                     "amd requires a realtime model with per-response tools and "
                     "client-controlled tool replies"
                 )
-            if activity.stt is None:
-                raise ValueError("amd requires session STT with realtime models")
+            if activity.stt is None and self._stt is None:
+                raise ValueError("amd requires session STT or AMD STT with realtime models")
         if self._session.amd:
             raise RuntimeError("amd is already active")
         if self._session.options.ivr_detection or self._session._ivr_activity is not None:
@@ -361,6 +365,7 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             stt=AMDRacingSTT(
                 self._stt,
                 self._session.conn_options.stt_conn_options,
+                race_session=not isinstance(activity.llm, llm.RealtimeModel),
             ),
         )
         try:

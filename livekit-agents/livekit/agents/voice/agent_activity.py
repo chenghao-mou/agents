@@ -1976,7 +1976,7 @@ class AgentActivity(RecognitionHooks):
     def commit_user_turn(
         self, *, transcript_timeout: float, stt_flush_duration: float, skip_reply: bool = False
     ) -> asyncio.Future[str]:
-        # Turn hooks authorize replies after STT commits the turn.
+        # Turn hooks gate realtime replies after EOT.
         if self._rt_session is not None and (self._session._turn_hooks is None or skip_reply):
             # commit audio buffer and conditionally trigger response generation
             self._rt_session.commit_audio()
