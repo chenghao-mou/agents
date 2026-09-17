@@ -121,6 +121,43 @@ An empty EOT keeps useful pending classification for the latest turn. Older AMD
 reply waits exit immediately. Reusing a prediction emits an `amd_prediction`
 event with `reason="reused"`, so every committed turn produces one event.
 
+## Realtime models
+
+OpenAI Realtime can generate AMD replies when AgentSession controls turn detection.
+Configure this before starting the session. AMD rejects server-side turn detection,
+automatic tool replies, and models without per-response tool selection.
+
+Supply session STT and a separate text LLM for classification. Realtime input
+transcription alone arrives after the audio commit, too late for AMD's current
+turn. Session STT supplies the transcript at EOT; the realtime model still receives
+audio for its replies. Pass `stt=None` to AMD to reuse session STT.
+
+```python
+from livekit.agents import AMD, Agent, AgentSession
+from livekit.plugins import openai, silero
+
+session = AgentSession(
+    llm=openai.realtime.RealtimeModel(turn_detection=None),
+    stt="cartesia/ink-whisper",
+    vad=silero.VAD.load(),
+    turn_handling={"turn_detection": "vad"},
+)
+await session.start(Agent(instructions="Call about an appointment."), room=ctx.room)
+
+async with AMD(
+    session,
+    llm="google/gemini-3.1-flash-lite",
+    stt=None,
+    participant_identity=callee_identity,
+) as detector:
+    # Create the SIP participant here, as in the example above.
+    result = await detector.execute()
+```
+
+AMD sends stage instructions with each authorized response and its tool follow-ups.
+These instructions do not change the realtime session's base instructions or saved
+history. The DTMF tool is available only to IVR replies and their tool follow-ups.
+
 ## Stage behavior
 
 | Prediction | Reply behavior | AMD lifecycle |
@@ -237,7 +274,8 @@ To place an outbound call, also set
 
 ## Current limits
 
-- Pipeline STT/LLM/TTS only. Realtime reply control is not implemented.
+- Realtime requires session STT, a separate text classifier, client-side turn
+  detection, per-response tool selection, and client-controlled tool replies.
 - Agent handoff during AMD is not supported.
 - No audio-based hold detection.
 - Session-level `ivr_detection` cannot run alongside AMD. Entry raises if it is enabled.

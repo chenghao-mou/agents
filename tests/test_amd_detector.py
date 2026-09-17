@@ -327,6 +327,8 @@ async def test_turn_hooks_control_replies_without_amd(allow_reply: bool) -> None
     calls: list[str] = []
 
     class Hooks:
+        reply_instructions = None
+
         def on_user_turn_committed(
             self, transcript: str, end_of_turn_delay: float | None
         ) -> TurnHooks:
@@ -1333,14 +1335,6 @@ async def test_inference_timeout_limit_completes_detection(limit: int | None) ->
 def test_max_inference_timeouts_must_be_positive(limit: int) -> None:
     with pytest.raises(ValueError, match="max_inference_timeouts must be positive"):
         AMD(AgentSession(), llm=None, stt=None, max_inference_timeouts=limit)
-
-
-@pytest.mark.asyncio
-async def test_realtime_model_is_rejected_before_installing_turn_hooks() -> None:
-    session = SimpleNamespace(_activity=SimpleNamespace(llm=Mock(spec=llm.RealtimeModel)))
-    detector = AMD(session, llm=None, stt=None)
-    with pytest.raises(ValueError, match="does not support realtime models"):
-        await detector.__aenter__()
 
 
 @pytest.mark.asyncio

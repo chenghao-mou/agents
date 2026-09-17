@@ -113,6 +113,7 @@ class _AMDTurnHooks:
     _amd: AMD
     _turn_id: int | None = None
     _track_voicemail: bool = False
+    reply_instructions: str | None = None
 
     def on_user_turn_committed(self, transcript: str, end_of_turn_delay: float | None) -> TurnHooks:
         return self._amd._on_user_turn_committed(transcript, end_of_turn_delay)
@@ -133,6 +134,8 @@ class _AMDTurnHooks:
             )
         decision = await self._amd._should_reply(self._turn_id, chat_ctx)
         self._track_voicemail = decision.track_voicemail
+        if decision.instructions_for is not None:
+            self.reply_instructions = self._amd._get_instructions(decision.instructions_for)
         return decision.allow
 
     def on_agent_turn_committed(self, handle: SpeechHandle) -> None:
@@ -148,8 +151,9 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
     participant. execute() waits for completion, not the first machine prediction.
     The SDK owns classification and stage control. Models can use any provider.
 
-    AMD uses the customer's current pipeline Agent. Realtime models and
-    agent handoffs during AMD are not supported. Normal hooks, interruptions,
+    AMD uses the customer's current Agent. Realtime models require client-side
+    turn detection, session STT, and per-response tool control. Agent handoffs
+    during AMD are not supported. Normal hooks, interruptions,
     playback, and StopResponse stay in AgentSession. Menu events are informational
     and never execute actions.
 
@@ -327,7 +331,16 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
         if activity is None:
             raise RuntimeError("start AgentSession before entering AMD")
         if isinstance(activity.llm, llm.RealtimeModel):
-            raise ValueError("amd does not support realtime models")
+            if activity._rt_turn_detection_enabled:
+                raise ValueError("amd requires client-side turn detection with realtime models")
+            capabilities = activity.llm.capabilities
+            if capabilities.auto_tool_reply_generation or not capabilities.per_response_tool_choice:
+                raise ValueError(
+                    "amd requires a realtime model with per-response tools and "
+                    "client-controlled tool replies"
+                )
+            if activity.stt is None:
+                raise ValueError("amd requires session STT with realtime models")
         if self._session.amd:
             raise RuntimeError("amd is already active")
         if self._session.options.ivr_detection or self._session._ivr_activity is not None:
@@ -805,16 +818,19 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             allow=True, instructions_for=None if category is AMDCategory.UNCERTAIN else category
         )
 
-    def _add_instructions(
-        self, chat_ctx: llm.ChatContext, stage: AMDCategory, turn_id: int
-    ) -> None:
+    def _get_instructions(self, stage: AMDCategory) -> str:
         content = self._instructions[stage]
         if stage is AMDCategory.MACHINE_IVR and self._voicemail_message_played:
             content += "\nThe voicemail message already played locally."
+        return content
+
+    def _add_instructions(
+        self, chat_ctx: llm.ChatContext, stage: AMDCategory, turn_id: int
+    ) -> None:
         chat_ctx.add_message(
             id=f"{self._control_prefix}{turn_id}",
             role="user",
-            content=content,
+            content=self._get_instructions(stage),
             extra={"amd_run": self._session_id, "amd_stage": self._state.value},
         )
 

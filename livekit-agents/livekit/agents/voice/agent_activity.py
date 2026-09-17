@@ -1821,6 +1821,8 @@ class AgentActivity(RecognitionHooks):
                         f"Available tools: {list(tool_ctx.function_tools.keys())}"
                     )
                 resolved_tools.append(tool)
+        elif all_tools != self.tools:
+            resolved_tools = all_tools
 
         handle = SpeechHandle.create(
             allow_interruptions=allow_interruptions
@@ -1974,7 +1976,8 @@ class AgentActivity(RecognitionHooks):
     def commit_user_turn(
         self, *, transcript_timeout: float, stt_flush_duration: float, skip_reply: bool = False
     ) -> asyncio.Future[str]:
-        if self._rt_session is not None:
+        # Turn hooks authorize replies after STT commits the turn.
+        if self._rt_session is not None and (self._session._turn_hooks is None or skip_reply):
             # commit audio buffer and conditionally trigger response generation
             self._rt_session.commit_audio()
             if not skip_reply:
@@ -2855,14 +2858,17 @@ class AgentActivity(RecognitionHooks):
 
         if turn_hooks is not None and not await turn_hooks.should_reply(temp_mutable_chat_ctx):
             self._cancel_preemptive_generation()
-            if info.new_transcript:
+            if info.new_transcript and not isinstance(self.llm, llm.RealtimeModel):
                 self._agent._chat_ctx.insert(user_message)
                 self._session._conversation_item_added(user_message)
             return
 
+        reply_instructions: NotGivenOr[str] = NOT_GIVEN
         if isinstance(self.llm, llm.RealtimeModel):
             # ignore stt transcription for realtime model
             user_message = None  # type: ignore
+            if turn_hooks is not None:
+                reply_instructions = turn_hooks.reply_instructions or NOT_GIVEN
         elif self.llm is None:
             return  # skip response if no llm is set
 
@@ -2918,6 +2924,7 @@ class AgentActivity(RecognitionHooks):
             speech_handle = self._generate_reply(
                 user_message=user_message,
                 chat_ctx=temp_mutable_chat_ctx,
+                instructions=reply_instructions,
                 input_details=InputDetails(modality="audio"),
             )
             # the invalidated preemptive attempt answered this same turn: one agent_turn
@@ -4197,6 +4204,7 @@ class AgentActivity(RecognitionHooks):
                 generation_ev=generation_ev,
                 model_settings=model_settings,
                 instructions=instructions,
+                tools=tools,
             )
         finally:
             # reset tool_choice and tools
@@ -4220,6 +4228,7 @@ class AgentActivity(RecognitionHooks):
         generation_ev: llm.GenerationCreatedEvent,
         model_settings: ModelSettings,
         instructions: str | None = None,
+        tools: list[llm.Tool | llm.Toolset] | None = None,
     ) -> None:
         with _agent_turn(
             speech_handle,
@@ -4233,6 +4242,7 @@ class AgentActivity(RecognitionHooks):
                     generation_ev=generation_ev,
                     model_settings=model_settings,
                     instructions=instructions,
+                    tools=tools,
                     inference_span=inference_span,
                 )
             finally:
@@ -4245,6 +4255,7 @@ class AgentActivity(RecognitionHooks):
         generation_ev: llm.GenerationCreatedEvent,
         model_settings: ModelSettings,
         instructions: str | None = None,
+        tools: list[llm.Tool | llm.Toolset] | None = None,
         inference_span: trace.Span,
     ) -> None:
         current_span = trace.get_current_span(context=speech_handle._agent_turn_context)
@@ -4281,7 +4292,7 @@ class AgentActivity(RecognitionHooks):
         # the turn ends, in which case record_realtime_metrics opens its own child span
         if self._realtime_spans is not None and generation_ev.response_id:
             self._realtime_spans[generation_ev.response_id] = inference_span
-        tool_ctx = llm.ToolContext(self.tools)
+        tool_ctx = llm.ToolContext(tools if tools is not None else self.tools)
 
         tasks: list[asyncio.Task[Any]] = []
         tees: list[utils.aio.itertools.Tee[Any]] = []
@@ -4783,6 +4794,8 @@ class AgentActivity(RecognitionHooks):
                             if draining or model_settings.tool_choice == "none"
                             else "auto",
                         ),
+                        instructions=instructions,
+                        tools=tools,
                         tool_reply=True,
                     ),
                     speech_handle=speech_handle,

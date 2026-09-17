@@ -17,6 +17,11 @@ class TurnHooks(Protocol):
     handle is accepted for output.
     """
 
+    @property
+    def reply_instructions(self) -> str | None:
+        """Temporary realtime instructions, available after ``should_reply`` allows a reply."""
+        ...
+
     def on_user_turn_committed(self, transcript: str, end_of_turn_delay: float | None) -> TurnHooks:
         """Bind hooks to the accepted user turn before the customer hook runs.
         Useful for per-turn classification task.
