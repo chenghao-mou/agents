@@ -11,6 +11,7 @@ import pytest
 
 from livekit import rtc
 from livekit.agents import AMD, NOT_GIVEN, Agent, AgentSession, inference, llm, utils
+from livekit.agents.types import NotGivenOr
 from livekit.agents.voice.amd import AMDCategory, AMDLifecycle
 from livekit.agents.voice.events import SpeechCreatedEvent
 from livekit.agents.voice.speech_handle import SpeechHandle
@@ -213,6 +214,48 @@ async def test_default_falls_back_to_session_model_without_amd_credentials(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("session_enabled", [False, True])
+@pytest.mark.parametrize("agent_enabled", [False, True, NOT_GIVEN])
+async def test_amd_restores_interruption_settings(
+    session_enabled: bool, agent_enabled: NotGivenOr[bool]
+) -> None:
+    agent = Agent(
+        instructions="Call about an appointment.",
+        turn_handling={"interruption": {"enabled": agent_enabled}}
+        if utils.is_given(agent_enabled)
+        else {},
+    )
+    async with running(
+        agent=agent,
+        session_options={
+            "turn_handling": {
+                "turn_detection": "manual",
+                "interruption": {"enabled": session_enabled},
+            }
+        },
+    ) as (detector, session, classifier, _):
+        assert session.options.interruption["enabled"] is True
+        assert agent.allow_interruptions is True
+        handles = []
+        session.on("speech_created", lambda event: handles.append(event.speech_handle))
+        await commit(detector, session, classifier, reply=True)
+        classifier.prediction(1, AMDCategory.MACHINE_SCREENING)
+        await session._activity._user_turn_completed_atask
+        assert handles[0].allow_interruptions
+        await handles[0]
+
+        await commit(detector, session, classifier)
+        classifier.prediction(2, AMDCategory.HUMAN)
+        await detector.execute()
+        assert session.options.interruption["enabled"] is session_enabled
+        assert agent.allow_interruptions is agent_enabled
+        following = session.generate_reply(user_input="hello")
+        expected = agent_enabled if utils.is_given(agent_enabled) else session_enabled
+        assert following.allow_interruptions is expected
+        await following
+
+
+@pytest.mark.asyncio
 async def test_missing_llm_does_not_install_turn_hooks() -> None:
     session = AgentSession(turn_handling={"turn_detection": "manual"})
     await session.start(Agent(instructions="Call about an appointment."))
@@ -235,8 +278,15 @@ async def test_setup_failure_cleans_up_amd(
     failure: str,
     error_type: type[BaseException],
 ) -> None:
-    session = AgentSession(llm=FakeLLM(), turn_handling={"turn_detection": "manual"})
-    await session.start(Agent(instructions="Call about an appointment."))
+    session = AgentSession(
+        llm=FakeLLM(),
+        turn_handling={"turn_detection": "manual", "interruption": {"enabled": False}},
+    )
+    agent = Agent(
+        instructions="Call about an appointment.",
+        turn_handling={"interruption": {"enabled": False}},
+    )
+    await session.start(agent)
     activity = session._activity
     assert activity is not None
     room = utils.EventEmitter()
@@ -276,6 +326,8 @@ async def test_setup_failure_cleans_up_amd(
         assert session.amd is None
         assert session._turn_hooks is None
         assert activity._authorization_allowed.is_set()
+        assert session.options.interruption["enabled"] is False
+        assert agent.allow_interruptions is False
         assert detector.lifecycle is AMDLifecycle.FINISHED
         assert not detector._tasks
         for emitter, event, handler in detector._subscriptions:
@@ -383,6 +435,7 @@ async def test_finish_detaches_before_task_cleanup_and_preserves_a_new_run(
             classifier.prediction(1, category)
             await asyncio.wait_for(cancelling.wait(), 2)
             assert terminal_session_state == [(None, None, True)]
+            assert session.current_agent.allow_interruptions is NOT_GIVEN
             assert not detector._resources.completion.done()
 
             session_audio = Mock()
@@ -411,8 +464,10 @@ async def test_finish_detaches_before_task_cleanup_and_preserves_a_new_run(
                 assert session.amd is following
                 assert session._turn_hooks is following._turn_hooks
                 assert not activity._authorization_allowed.is_set()
+                assert session.current_agent.allow_interruptions is True
                 cancel_pending.assert_not_called()
                 cancel_preemptive.assert_not_called()
+            assert session.current_agent.allow_interruptions is NOT_GIVEN
         finally:
             release.set()
 

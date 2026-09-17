@@ -24,6 +24,8 @@ The application still decides whether to continue or end the call.
 
 Start AgentSession first. Enter AMD before creating the SIP participant.
 Do not generate an `on_enter` greeting before AMD starts.
+Let AgentSession generate replies during AMD. Direct calls to `session.say()`
+or `session.generate_reply()` during detection are not supported.
 
 ```python
 import logging
@@ -66,8 +68,9 @@ after detection ends. Import `AMDLifecycle` from `livekit.agents`.
 
 AMD allows five seconds for the participant's audio track to be published and
 subscribed. If that fails, it completes with `participant_missing` and releases
-the session. Set the SIP answer timeout when placing the call. The detection
-`timeout` starts when listening begins.
+the session. A participant or room disconnect during setup completes with
+`participant_disconnected`. Set the SIP answer timeout when placing the call.
+The detection `timeout` starts when listening begins.
 
 ## Model selection and transcript race
 
@@ -104,9 +107,10 @@ At EOT, AMD commits the selected source's available transcript immediately, even
 it is empty. Finals received after EOT accumulate for the next turn. The AMD STT
 must support streaming. It uses a single stream without flushing at EOT,
 matching session STT. AMD receives the unsuppressed participant audio during AEC
-warmup and uninterruptible agent speech, while session STT receives silence. A human
-who talks over the agent's greeting must still be heard. The classifier prompt treats
-the transcript as untrusted evidence, so echoed agent speech cannot instruct it.
+warmup, while session STT receives silence. AgentSession disables AEC warmup by
+default for outbound SIP calls; an explicit `aec_warmup_duration` takes precedence.
+The classifier prompt treats the transcript as untrusted evidence, so echoed
+agent speech cannot instruct it.
 
 If the AMD stream fails, the open turn uses its buffered session transcript, even if
 it is empty. Subsequent turns also use the session transcript. The sources are never
@@ -217,9 +221,14 @@ Before reply authorization, new speech restarts the silence wait for the committ
 turn, even if the new speech produces no accepted turn. After authorization,
 AgentSession handles speech, silence, and interruptions. The next committed turn
 pauses authorization until AMD decides whether to reply.
+AMD enables interruptions on the session and current Agent when it starts,
+then restores both settings when it finishes, including cancellation or setup failure.
+AgentSession's false-interruption handling can resume paused speech when the
+audio output supports pause and resume.
 A new EOT uses the accepted category even if the previous reply is still waiting.
-Empty turns reuse pending inference or the current category. AMD retains earlier
-transcripts. Superseded requests cannot emit predictions or authorize old replies.
+Empty turns reuse pending inference or the current category without adding empty
+messages to classifier history. AMD retains earlier transcripts and successful
+DTMF calls. Superseded requests cannot emit predictions or authorize old replies.
 
 AMD records voicemail delivery only after successful, uninterrupted audio playback.
 This record survives transitions through `uncertain` and IVR, so returning to

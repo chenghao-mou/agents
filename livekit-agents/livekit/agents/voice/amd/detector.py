@@ -100,12 +100,14 @@ class ReplyDecision:
 
 @dataclass
 class _AMDResources:
-    """Resources that exist from ``__aenter__`` until completion."""
+    """Resources and saved settings from ``__aenter__`` until completion."""
 
     agent: Agent
     llm: llm.LLM
     completion: asyncio.Future[AMDCompletedEvent]
     stt: AMDRacingSTT
+    session_allow_interruptions: bool
+    agent_allow_interruptions: NotGivenOr[bool]
 
 
 @dataclass
@@ -156,6 +158,9 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
     control. Agent handoffs during AMD are not supported. Normal hooks, interruptions,
     playback, and StopResponse stay in AgentSession. Menu events are informational
     and never execute actions.
+    AMD enables interruptions on the session and current Agent, then restores
+    their settings when detection finishes. Direct speech generation during AMD
+    is not supported.
 
     Example:
         async with AMD(session) as amd:
@@ -364,11 +369,15 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
                 self._session.conn_options.stt_conn_options,
                 race_session=activity.stt is not None,
             ),
+            session_allow_interruptions=self._session.options.interruption["enabled"],
+            agent_allow_interruptions=activity.agent.allow_interruptions,
         )
         try:
             self._started_at = time.time()
             self._session._amd = self
             self._session._turn_hooks = self._turn_hooks
+            self._session.options.interruption["enabled"] = True
+            activity.agent._allow_interruptions = True
             activity._pause_authorization()
 
             self._subscriptions = [
@@ -468,7 +477,10 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             if self.lifecycle is not AMDLifecycle.FINISHED:
                 _start_listening()
         except (RuntimeError, asyncio.TimeoutError):
-            self._finish(AMDReason.PARTICIPANT_MISSING)
+            reason = AMDReason.PARTICIPANT_MISSING
+            if (room_io := self._session._room_io) and not room_io.room.isconnected():
+                reason = AMDReason.PARTICIPANT_DISCONNECTED
+            self._finish(reason)
 
     # region: hooks
 
@@ -536,9 +548,9 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             speech_duration=duration,
         )
         self._turns[turn.turn_id] = turn
-        self._chat_ctx.add_transcript(turn)
         self._voicemail_turn_id = None
         if turn_transcript.transcript:
+            self._chat_ctx.add_transcript(turn)
             self._cancel_classification()
             self._pending_turn = turn
             self._inference_deadline = now + self._options.inference_timeout
@@ -1029,6 +1041,10 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             self._voicemail_handle.remove_done_callback(self._on_voicemail_done)
             self._voicemail_handle = None
         if self._session._amd is self:
+            self._session.options.interruption["enabled"] = (
+                self._resources.session_allow_interruptions
+            )
+            self._resources.agent._allow_interruptions = self._resources.agent_allow_interruptions
             self._session._amd = None
             if self._session._turn_hooks is self._turn_hooks:
                 self._session._turn_hooks = None

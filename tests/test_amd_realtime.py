@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -233,6 +234,53 @@ async def test_untranscribed_speech_does_not_revoke_reply_authorization() -> Non
         await asyncio.wait_for(activity._user_turn_completed_atask, 2)
         assert rt.generate_reply_calls == 1
         assert output.captured_playout_segments == 1
+
+
+async def test_amd_interrupts_a_pending_reply_despite_disabled_interruptions() -> None:
+    agent = Agent(
+        instructions="Call about an appointment.",
+        turn_handling={"interruption": {"enabled": False}},
+    )
+    async with running(agent=agent) as (_, session, classifier, rt):
+        handle = await reply(session, classifier, rt, AMDCategory.MACHINE_SCREENING)
+        activity = session._activity
+        assert activity.on_end_of_turn(end_of_turn("Please hold."))
+        await classifier.request()
+        classifier.prediction(2, AMDCategory.WAIT)
+        await asyncio.wait_for(activity._user_turn_completed_atask, 2)
+        await asyncio.wait_for(handle, 0.1)
+        assert handle.interrupted
+        assert rt.generate_reply_calls == 1
+        assert session.output.audio.captured_playout_segments == 0
+
+
+async def test_amd_preserves_false_interruption_resume() -> None:
+    agent = Agent(
+        instructions="Call about an appointment.",
+        turn_handling={"interruption": {"enabled": False}},
+    )
+    async with running(agent=agent, turn_detection="vad") as (detector, session, classifier, rt):
+        output = FakeAudioOutput(can_pause=True)
+        session.output.audio = output
+        session.options.interruption["min_words"] = 0
+        session.options.interruption["false_interruption_timeout"] = 0.1
+        resumed = []
+        session.on("agent_false_interruption", lambda event: resumed.append(event.resumed))
+        handle = await reply(session, classifier, rt, AMDCategory.MACHINE_SCREENING)
+        activity = session._activity
+        await activity._audio_recognition._vad_atask
+        respond(rt, duration=1)
+        await eventually(lambda: session.agent_state == "speaking")
+        activity.on_start_of_speech(None, time.time())
+        activity._interrupt_by_audio_activity()
+        assert output._paused_at is not None
+        assert handle.allow_interruptions
+        activity.on_end_of_speech(None, speech_end_time=time.time())
+        await asyncio.wait_for(handle, 2)
+        assert resumed == [True]
+        assert not handle.interrupted
+        assert output.captured_playout_segments == 1
+        assert detector._turn_id == 1
 
 
 async def test_stage_instructions_expire_after_first_human_reply() -> None:

@@ -1404,6 +1404,51 @@ async def test_missing_audio_subscription_times_out_and_releases_session(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("waiting_for", ["track", "answer"])
+@pytest.mark.parametrize("room_disconnected", [False, True])
+async def test_disconnect_during_setup_reports_disconnected(
+    waiting_for: str, room_disconnected: bool
+) -> None:
+    room = utils.EventEmitter()
+    room.isconnected = Mock(return_value=True)
+    publication = SimpleNamespace(
+        sid="track",
+        kind=rtc.TrackKind.KIND_AUDIO,
+        subscribed=waiting_for == "answer",
+        track=object() if waiting_for == "answer" else None,
+    )
+    participant = SimpleNamespace(
+        identity="callee",
+        kind=rtc.ParticipantKind.PARTICIPANT_KIND_SIP,
+        attributes={"sip.callStatus": "ringing"},
+        track_publications={"track": publication},
+    )
+    room.remote_participants = {"callee": participant}
+    session = AgentSession(llm=FakeLLM(), turn_handling={"turn_detection": "manual"})
+    await session.start(Agent(instructions="Hello"))
+    session._room_io = SimpleNamespace(room=room, set_participant=Mock())
+    try:
+        async with AMD(session, llm=None, stt=None, participant_identity="callee") as detector:
+            event = (
+                "track_subscribed" if waiting_for == "track" else "participant_attributes_changed"
+            )
+            await eventually(lambda: bool(room._events.get(event)))
+            if room_disconnected:
+                room.isconnected.return_value = False
+                room.emit("connection_state_changed", rtc.ConnectionState.CONN_DISCONNECTED)
+            else:
+                room.remote_participants.clear()
+                room.emit("participant_disconnected", participant)
+            assert (await detector.execute()).reason is AMDReason.PARTICIPANT_DISCONNECTED
+            assert session.amd is None
+            assert session._activity._authorization_allowed.is_set()
+            assert not any(room._events.values())
+    finally:
+        session._room_io = None
+        await session.aclose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("wait_until_answered", [True, False])
 async def test_sip_answer_gating_and_early_media(
     monkeypatch: pytest.MonkeyPatch, wait_until_answered: bool
@@ -1707,10 +1752,9 @@ async def test_transcript_received_after_eot_is_kept_in_next_request() -> None:
         assert second.current_turn.extra["turn_id"] == 3
         assert second.current_turn.text_content == "Okay, connecting you."
         assert second.current_turn.extra["transcript_source"] == "amd"
-        assert second.earlier_turns[0].text_content == ""
-        assert second.earlier_turns[1].text_content == first.current_turn.text_content
+        assert second.earlier_turns == [first.current_turn]
         assert (
-            second.earlier_turns[1].extra["transcript_source"]
+            second.earlier_turns[0].extra["transcript_source"]
             == first.current_turn.extra["transcript_source"]
             == "amd"
         )
@@ -1741,8 +1785,10 @@ async def test_late_final_after_many_empty_turns_is_committed_at_the_next_eot() 
         request = await classifier.request()
         assert request.current_turn.extra["turn_id"] == 22
         assert request.current_turn.text_content == "Hello, can you hear me?"
-        assert not dtmf_calls(request.chat_ctx)
-        assert [turn.extra["turn_id"] for turn in request.earlier_turns] == list(range(3, 22))
+        assert [json.loads(call.arguments) for call in dtmf_calls(request.chat_ctx)] == [
+            {"events": ["1"]}
+        ]
+        assert request.earlier_turns == []
         classifier.prediction(22, AMDCategory.HUMAN)
         assert (await detector.execute()).category == AMDCategory.HUMAN
 
@@ -1840,7 +1886,7 @@ async def test_dtmf_on_an_empty_turn_is_context_not_an_inference_trigger() -> No
         assert [json.loads(call.arguments) for call in dtmf_calls(request.chat_ctx)] == [
             {"events": ["1"]}
         ]
-        assert request.earlier_turns[0].text_content == ""
+        assert request.earlier_turns == []
 
 
 @pytest.mark.asyncio
@@ -2270,8 +2316,11 @@ async def test_classifier_history_is_bounded_and_saved_decisions_survive() -> No
         classifier.prediction(1, AMDCategory.MACHINE_SCREENING)
         await detector._should_reply(1, llm.ChatContext())
         first_prediction = detector._turns[1].prediction
-        for _ in range(22):
-            commit_turn(detector, end_of_turn(""))
+        for turn_id in range(2, 24):
+            hooks = commit_turn(detector, end_of_turn(f"prompt {turn_id}"))
+            await classifier.request()
+            classifier.prediction(turn_id, AMDCategory.MACHINE_SCREENING)
+            await hooks.should_reply(llm.ChatContext())
         dtmf_executed(detector._session, "2#")
         commit_turn(detector, end_of_turn("latest prompt"))
         request = await classifier.request()
@@ -2281,9 +2330,27 @@ async def test_classifier_history_is_bounded_and_saved_decisions_survive() -> No
         ]
         assert [turn.extra["turn_id"] for turn in request.earlier_turns] == list(range(7, 24))
         assert len(request.chat_ctx.items[2:]) == 20
-        assert all(turn.text_content == "" for turn in request.earlier_turns)
+        assert all(turn.text_content for turn in request.earlier_turns)
         assert detector._turns[1].prediction is first_prediction
         assert first_prediction.category == AMDCategory.MACHINE_SCREENING
+
+
+@pytest.mark.asyncio
+async def test_empty_turns_preserve_transcript_and_dtmf_history() -> None:
+    async with running() as (detector, session, classifier, _):
+        hooks = commit_turn(detector, end_of_turn("For sales press 1."))
+        first = await classifier.request()
+        classifier.prediction(1, AMDCategory.MACHINE_IVR)
+        await hooks.should_reply(llm.ChatContext())
+        sent = dtmf_executed(session, "1")
+        for _ in range(22):
+            commit_turn(detector, end_of_turn(""))
+        assert classifier.requests.empty()
+        commit_turn(detector, end_of_turn("One moment please."))
+        request = await classifier.request()
+        assert request.earlier_turns == [first.current_turn]
+        assert dtmf_calls(request.chat_ctx) == sent.function_calls
+        assert request.current_turn.extra["turn_id"] == 24
 
 
 @pytest.mark.asyncio
