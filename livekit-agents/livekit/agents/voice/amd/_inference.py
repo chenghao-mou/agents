@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from pydantic import BaseModel, Field
 
@@ -35,7 +35,8 @@ A busy person is not automatically machine-unavailable. A screener is not an IVR
 Menu instructions after voicemail can be machine-ivr. A person taking over can be human.
 
 Allowed next categories are supplied with each request. If new evidence is inconclusive,
-return uncertain; AMD keeps an established stage. Do not infer hold music from the transcript.
+return uncertain. This reopens all categories on the next turn.
+Do not infer hold music from the transcript.
 Classify a brief conversational greeting after a sent digit selects a person as human,
 unless the current transcript provides evidence of automation.
 
@@ -82,13 +83,14 @@ async def _structured_response(
     schema: type[ResponseT],
     *,
     conn_options: APIConnectOptions,
+    parameters: dict[str, Any] | None = None,
 ) -> ResponseT:
     # use raw schema so all LLM can support this, response_format support is limited
     @llm.function_tool(
         raw_schema={
             "name": "record_result",
             "description": "Record the result using the supplied schema.",
-            "parameters": schema.model_json_schema(),
+            "parameters": parameters if parameters is not None else schema.model_json_schema(),
         }
     )
     async def record_result(raw_arguments: dict[str, object]) -> None:
@@ -118,7 +120,16 @@ async def classify(
     chat_ctx = llm.ChatContext()
     chat_ctx.add_message(role="system", content=CLASSIFY_PROMPT)
     chat_ctx.add_message(role="user", content=request.model_dump_json(exclude_none=True))
-    return await _structured_response(model, chat_ctx, AMDResponse, conn_options=conn_options)
+    parameters = AMDResponse.model_json_schema()
+    parameters["$defs"]["AMDCategory"]["enum"] = [
+        category.value for category in request.allowed_next_categories
+    ]
+    response = await _structured_response(
+        model, chat_ctx, AMDResponse, conn_options=conn_options, parameters=parameters
+    )
+    if response.category not in request.allowed_next_categories:
+        raise ValueError(f"category {response.category} is not allowed from {request.stage}")
+    return response
 
 
 async def extract_ivr_menu(

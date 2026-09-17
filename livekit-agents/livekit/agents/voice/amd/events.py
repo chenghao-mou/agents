@@ -1,7 +1,14 @@
-from enum import Enum
+from enum import Enum, auto
 from typing import Literal
 
 from pydantic import BaseModel, Field, computed_field
+
+
+class AMDLifecycle(Enum):
+    INITIALIZED = auto()
+    PENDING = auto()
+    ACTIVE = auto()
+    FINISHED = auto()
 
 
 class AMDCategory(str, Enum):

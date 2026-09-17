@@ -103,9 +103,10 @@ async def test_amd_uses_a_required_structured_tool(
         assert chat.call_args.kwargs["parallel_tool_calls"] is False
         tools = chat.call_args.kwargs["tools"]
         assert len(tools) == 1
-        assert (
-            get_raw_function_info(tools[0]).raw_schema["parameters"] == schema.model_json_schema()
-        )
+        expected_schema = schema.model_json_schema()
+        if not menu:
+            expected_schema["$defs"]["AMDCategory"]["enum"] = REQUEST.allowed_next_categories
+        assert get_raw_function_info(tools[0]).raw_schema["parameters"] == expected_schema
         tool_ctx = llm.ToolContext(tools)
         assert tool_ctx.parse_function_tools("openai")
         assert tool_ctx.parse_function_tools("google")
@@ -135,3 +136,59 @@ async def test_classifier_requires_exactly_one_result_tool(names: list[str]) -> 
     )
     with pytest.raises(ValueError, match="exactly one record_result"):
         await _inference.classify(model, REQUEST)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stage",
+    [
+        AMDCategory.UNCERTAIN,
+        AMDCategory.MACHINE_SCREENING,
+        AMDCategory.MACHINE_VM,
+        AMDCategory.MACHINE_IVR,
+    ],
+)
+@pytest.mark.parametrize("category", list(AMDCategory))
+async def test_classifier_schema_and_validation_limit_predictions_to_allowed_states(
+    stage: AMDCategory,
+    category: AMDCategory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from livekit.agents.voice.amd import _fsm
+
+    request = REQUEST.model_copy(
+        update={"stage": stage, "allowed_next_categories": sorted(_fsm.ALLOWED[stage])}
+    )
+    model = FakeLLM(
+        fake_responses=[
+            FakeLLMResponse(
+                input=request.model_dump_json(exclude_none=True),
+                content="",
+                ttft=0,
+                duration=0,
+                tool_calls=[
+                    llm.FunctionToolCall(
+                        name="record_result",
+                        arguments=json.dumps({"category": category}),
+                        call_id="result",
+                    )
+                ],
+            )
+        ]
+    )
+    chat = Mock(wraps=model.chat)
+    monkeypatch.setattr(model, "chat", chat)
+    try:
+        if category in request.allowed_next_categories:
+            assert (await _inference.classify(model, request)).category == category
+        else:
+            with pytest.raises(ValueError, match="not allowed"):
+                await _inference.classify(model, request)
+        tools = chat.call_args.kwargs["tools"]
+        schema = get_raw_function_info(tools[0]).raw_schema["parameters"]
+        assert schema["$defs"]["AMDCategory"]["enum"] == request.allowed_next_categories
+        tool_ctx = llm.ToolContext(tools)
+        for provider in ("openai", "google", "anthropic"):
+            assert tool_ctx.parse_function_tools(provider)
+    finally:
+        await model.aclose()

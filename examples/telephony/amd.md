@@ -107,9 +107,9 @@ reply waits exit immediately. Reusing a prediction does not emit another event.
 
 | Prediction | Reply behavior | AMD lifecycle |
 | --- | --- | --- |
-| `uncertain` | Use the current stage; otherwise permit normal reply handling. | Continue within the uncertainty and time limits. |
+| `uncertain` | Permit normal reply handling. | Reopen all categories for the next turn. |
 | `machine-screening` | Answer the screener's latest question briefly. | Continue listening for the next turn. |
-| `machine-vm` | Generate one message per voicemail stage. | Keep listening during and after playback. |
+| `machine-vm` | Deliver one complete, uninterrupted message. | Keep listening during and after playback. |
 | `machine-ivr` | Use the actual prompt to choose DTMF or a spoken response. | Continue listening for the next turn. |
 | `human` | After a machine stage, supply temporary human instructions. Otherwise use normal Agent instructions. | Complete AMD. |
 | `machine-unavailable` | Cancel held replies; do not generate a machine reply. | Complete AMD. |
@@ -124,21 +124,29 @@ The customer hook runs before AMD adds its instructions.
 
 The normal interruption path handles a person who speaks during a message.
 Interruption does not itself authorize a reply. AMD still checks the next turn.
-An uncertain prediction does not reset an established stage.
+An uncertain prediction moves the category to `uncertain`. The current turn gets
+a normal reply. AMD classifies again on the next transcribed turn.
 
-Machine predictions wait for 1.5 seconds of continuous participant silence.
-This includes screening, voicemail, IVR, and unavailable results. The wait covers
-both the prediction event and permission to reply. Silence before EOT and during
-classification counts toward the threshold. A ready result does not time out
-while it waits for silence.
+The FSM accepts classification results and returns the next category and effects.
+Its allowed transitions also constrain the classifier's output schema. AMD owns
+turn IDs, inference, deadlines, counters, fallback, reply authorization, and playback.
+Timeouts and playback do not change the FSM. Repeated IVR predictions still request
+menu extraction.
 
-Human and initial `uncertain` predictions use normal EOT timing. If `uncertain`
-keeps an established machine stage, the machine silence rule still applies.
-New speech pauses a pending release. Speech end restarts the silence wait for
+Accepted predictions update the category and emit an event immediately. Replies
+to screening, voicemail, and IVR wait for 1.5 seconds of continuous participant
+silence. Silence before EOT and during classification counts toward the threshold.
+Human and `uncertain` replies use normal EOT timing. An unavailable result ends AMD.
+New speech pauses reply authorization. Speech end restarts the silence wait for
 the already committed turn, even if the new speech produces no accepted turn.
-Before release, a new EOT can replace the prediction, or reuse it if there is no
-new transcript. AMD retains the earlier transcript. Superseded results do not
-emit a prediction or authorize an old reply.
+A new EOT uses the accepted category even if the previous reply is still waiting.
+Empty turns reuse pending inference or the current category. AMD retains earlier
+transcripts. Superseded requests cannot emit predictions or authorize old replies.
+
+AMD records voicemail delivery only after successful, uninterrupted audio playback.
+This record survives transitions through `uncertain` and IVR, so returning to
+voicemail does not send a second message. An interrupted or failed attempt can be
+retried on a later voicemail turn. An attempt still playing blocks another message.
 
 ## DTMF and menus
 
@@ -161,11 +169,11 @@ or execute the observed menu. Extraction has a 5-second deadline and at most
 | Control | Default | Behavior |
 | --- | --- | --- |
 | `inference_timeout` | 1.5 seconds | Use the current stage on timeout; its silence rule still applies. |
-| `machine_silence_threshold` | 1.5 seconds | Wait for continuous silence before a machine prediction releases the turn. Set to `0` to disable. |
+| `machine_silence_threshold` | 1.5 seconds | Wait for continuous silence before authorizing a machine reply. Set to `0` to disable. |
 | `idle_timeout` | 10 seconds | Complete after inactivity outside voicemail. |
 | `voicemail_idle_timeout` | 60 seconds | Allow a delayed post-message menu after playback. |
 | `timeout` | 120 seconds | Fixed overall limit from the start of listening. |
-| `max_uncertain_turns` | 3 | Complete after consecutive uncertain predictions without an established stage. |
+| `max_uncertain_turns` | 3 | Complete after consecutive uncertain model predictions. |
 | `max_inference_timeouts` | 3 | Complete after this many prediction timeouts. A valid prediction resets the count. |
 
 At the inference deadline, AMD cancels the request and keeps the current stage.
