@@ -496,8 +496,13 @@ async def test_empty_turn_does_not_delay_the_next_prediction() -> None:
 
         await asyncio.sleep(0.1)
         speech_started(detector)
+        transcript = "Please state your name and why you are calling."
+        stream.send_fake_transcript(transcript)
+        await eventually(
+            lambda: detector._resources.stt._current.snapshot("amd").transcript == transcript
+        )
         speech_ended(detector, 0)
-        info = end_of_turn("Please state your name and why you are calling.")
+        info = end_of_turn(transcript)
         hooks = commit_turn(detector, info)
         assert (await classifier.request()).current_turn.extra["turn_id"] == 2
         classifier.prediction(2, AMDCategory.MACHINE_SCREENING)
