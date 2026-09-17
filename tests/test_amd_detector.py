@@ -1608,9 +1608,17 @@ async def test_dtmf_tool_propagates_cancelled_publish() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("winner", ["session", "amd"])
-async def test_first_final_wins_for_amd_without_changing_agent_transcript(winner: str) -> None:
+@pytest.mark.parametrize("session_stt", [False, True])
+async def test_first_final_wins_for_amd_without_changing_agent_transcript(
+    winner: str, session_stt: bool
+) -> None:
     stt = DrainingSTT()
-    async with running(stt=stt) as (detector, session, classifier, reply_model):
+    async with running(stt=stt, session_options={"stt": FakeSTT() if session_stt else None}) as (
+        detector,
+        session,
+        classifier,
+        reply_model,
+    ):
         reply_model.fake_response_map["session transcript"] = FakeLLMResponse(
             input="session transcript", content="Hello.", ttft=0, duration=0
         )
@@ -1618,7 +1626,7 @@ async def test_first_final_wins_for_amd_without_changing_agent_transcript(winner
         if winner == "session":
             transcribe(detector, "session transcript")
         stream.send_fake_transcript("AMD transcript")
-        if winner == "amd":
+        if winner == "amd" or not session_stt:
             await eventually(
                 lambda: (
                     detector._resources.stt._current.snapshot(
@@ -1632,10 +1640,11 @@ async def test_first_final_wins_for_amd_without_changing_agent_transcript(winner
         info = end_of_turn("session transcript")
         session._activity.on_end_of_turn(info)
         request = await classifier.request()
+        expected_source = winner if session_stt else "amd"
         assert request.current_turn.text_content == (
-            f"{winner if winner == 'session' else 'AMD'} transcript"
+            "session transcript" if expected_source == "session" else "AMD transcript"
         )
-        assert request.current_turn.extra["transcript_source"] == winner
+        assert request.current_turn.extra["transcript_source"] == expected_source
         assert not stream.flushed.is_set()
         classifier.prediction(1, AMDCategory.UNCERTAIN)
         reply = await asyncio.wait_for(reply_model.calls.get(), 2)

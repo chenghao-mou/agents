@@ -44,11 +44,14 @@ async def running(
     agent: Agent | None = None,
     session_stt: bool = True,
     amd_stt: stt.STT | None = None,
+    user_transcription: bool = True,
     turn_detection: Literal["manual", "vad"] = "manual",
 ) -> AsyncIterator[tuple[AMD, AgentSession, ClassifierLLM, FakeRealtimeSession]]:
     model = FakeRealtimeModel(
         capabilities=fake_capabilities(
-            can_disable_turn_detection=True, auto_tool_reply_generation=False
+            can_disable_turn_detection=True,
+            auto_tool_reply_generation=False,
+            user_transcription=user_transcription,
         )
     )
     async with AgentSession(
@@ -126,7 +129,6 @@ def respond(
         ("server_turn_detection", "client-side turn detection"),
         ("auto_tool_reply", "client-controlled tool replies"),
         ("session_tools_only", "per-response tools"),
-        ("no_user_transcription", "user transcription"),
         ("missing_stt", "session STT"),
         ("missing_classifier", "LLM for classification"),
     ],
@@ -139,7 +141,6 @@ async def test_unsupported_configuration_does_not_install_amd(
             can_disable_turn_detection=configuration != "server_turn_detection",
             auto_tool_reply_generation=configuration == "auto_tool_reply",
             per_response_tool_choice=configuration != "session_tools_only",
-            user_transcription=configuration != "no_user_transcription",
         )
     )
     async with AgentSession(
@@ -231,6 +232,68 @@ async def test_suppressed_reply_keeps_only_the_realtime_transcript(
             assert [(m.id, m.text_content) for m in messages] == [("user-audio", "hello")]
 
 
+@pytest.mark.parametrize("source", ["session", "amd", "both"])
+@pytest.mark.parametrize(
+    "category", [AMDCategory.WAIT, AMDCategory.MACHINE_UNAVAILABLE, AMDCategory.HUMAN]
+)
+async def test_external_stt_preserves_history_without_native_transcription(
+    source: str, category: AMDCategory
+) -> None:
+    amd_stt = DrainingSTT() if source != "session" else None
+    async with running(session_stt=source != "amd", amd_stt=amd_stt, user_transcription=False) as (
+        detector,
+        session,
+        classifier,
+        rt,
+    ):
+        handles: list[SpeechHandle] = []
+        added: list[llm.ChatMessage] = []
+        session.on("speech_created", lambda ev: handles.append(ev.speech_handle))
+        session.on("conversation_item_added", lambda ev: added.append(ev.item))
+        activity = session._activity
+        activity.push_audio(_audio_frame(0.1))
+        if source != "amd":
+            await activity._audio_recognition._on_stt_event(
+                stt.SpeechEvent(
+                    type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                    alternatives=[
+                        stt.SpeechData(text="Session transcript.", language=LanguageCode("en"))
+                    ],
+                )
+            )
+        if amd_stt is not None and source == "amd":
+            amd_stt.streams[0].send_fake_transcript("AMD transcript.")
+            await eventually(
+                lambda: (
+                    detector._resources.stt._current.snapshot("amd").transcript == "AMD transcript."
+                )
+            )
+
+        await session.commit_user_turn()
+        request = await classifier.request()
+        assert request.current_turn.text_content == (
+            "AMD transcript." if source == "amd" else "Session transcript."
+        )
+        if source == "both":
+            assert not detector._resources.stt.amd_stt_active
+        assert rt.generate_reply_calls == 0
+        classifier.prediction(1, category)
+        await asyncio.wait_for(activity._user_turn_completed_atask, 2)
+        if category is AMDCategory.HUMAN:
+            await eventually(lambda: rt.generate_reply_calls == 1)
+            respond(rt)
+            await asyncio.wait_for(handles[0], 2)
+        else:
+            assert rt.generate_reply_calls == 0
+
+        expected = "AMD transcript." if source == "amd" else "Session transcript."
+        for context in (session.current_agent.chat_ctx, session.history):
+            assert [m.text_content for m in context.messages() if m.role == "user"] == [expected]
+        assert [m.text_content for m in added if m.role == "user"] == [expected]
+        assert not [m for m in rt.chat_ctx.messages() if m.role == "user"]
+        assert rt.committed
+
+
 @pytest.mark.parametrize("category", [AMDCategory.WAIT, AMDCategory.HUMAN])
 async def test_session_stt_classifies_before_realtime_transcription(category: AMDCategory) -> None:
     async with running() as (_, session, classifier, rt):
@@ -303,7 +366,7 @@ async def test_manual_realtime_commit_without_amd(session_stt: bool, skip_reply:
 
 @pytest.mark.parametrize("session_stt", [False, True])
 @pytest.mark.parametrize("turn_detection", ["manual", "vad"])
-async def test_dedicated_amd_stt_supplies_transcripts_without_racing(
+async def test_amd_stt_supplies_transcripts_at_eot(
     session_stt: bool, turn_detection: Literal["manual", "vad"]
 ) -> None:
     amd_stt = DrainingSTT()
@@ -319,12 +382,13 @@ async def test_dedicated_amd_stt_supplies_transcripts_without_racing(
         recognition = activity._audio_recognition
         activity.push_audio(_audio_frame(0.1))
         stream = amd_stt.streams[0]
-        rt.emit(
-            "input_audio_transcription_completed",
-            llm.InputTranscriptionCompleted(
-                item_id="previous-audio", transcript="Late realtime transcript.", is_final=True
-            ),
-        )
+        if not session_stt:
+            rt.emit(
+                "input_audio_transcription_completed",
+                llm.InputTranscriptionCompleted(
+                    item_id="previous-audio", transcript="Late realtime transcript.", is_final=True
+                ),
+            )
         assert detector._resources.stt.amd_stt_active
 
         if turn_detection == "vad":

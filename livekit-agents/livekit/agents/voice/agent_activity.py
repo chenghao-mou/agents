@@ -2856,6 +2856,15 @@ class AgentActivity(RecognitionHooks):
         on_user_turn_completed_delay = time.perf_counter() - start_time
         metrics_report["on_user_turn_completed_delay"] = on_user_turn_completed_delay
 
+        if (
+            turn_hooks is not None
+            and info.new_transcript
+            and isinstance(self.llm, llm.RealtimeModel)
+            and not self.llm.capabilities.user_transcription
+        ):
+            self._agent._chat_ctx.insert(user_message)
+            self._session._conversation_item_added(user_message)
+
         if turn_hooks is not None and not await turn_hooks.should_reply(temp_mutable_chat_ctx):
             self._cancel_preemptive_generation()
             if info.new_transcript and not isinstance(self.llm, llm.RealtimeModel):

@@ -152,7 +152,7 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
     The SDK owns classification and stage control. Models can use any provider.
 
     AMD uses the customer's current Agent. Realtime models require client-side
-    turn detection, session or AMD STT, user transcription, and per-response tool
+    turn detection, session or AMD STT, and per-response tool
     control. Agent handoffs during AMD are not supported. Normal hooks, interruptions,
     playback, and StopResponse stay in AgentSession. Menu events are informational
     and never execute actions.
@@ -172,9 +172,9 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
         stt: Optional streaming STT model for AMD. When omitted, use
             ``cartesia/ink-whisper`` if LiveKit Cloud credentials are available;
             otherwise use only the session transcript. Pass None to always use
-            only the session transcript. With realtime models, AMD uses this STT
-            without racing the session transcript. A string selects a LiveKit
-            Inference model.
+            only the session transcript. AMD races this STT against the session
+            transcript only when session STT is configured. A string selects a
+            LiveKit Inference model.
         participant_identity: Select the participant before placing an outbound call.
         wait_until_answered: Discard pre-answer audio from AMD and AgentSession
             when True. When False, listen to subscribed SIP early media.
@@ -336,8 +336,6 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             if activity._rt_turn_detection_enabled:
                 raise ValueError("amd requires client-side turn detection with realtime models")
             capabilities = activity.llm.capabilities
-            if not capabilities.user_transcription:
-                raise ValueError("amd requires user transcription with realtime models")
             if capabilities.auto_tool_reply_generation or not capabilities.per_response_tool_choice:
                 raise ValueError(
                     "amd requires a realtime model with per-response tools and "
@@ -365,7 +363,7 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             stt=AMDRacingSTT(
                 self._stt,
                 self._session.conn_options.stt_conn_options,
-                race_session=not isinstance(activity.llm, llm.RealtimeModel),
+                race_session=activity.stt is not None,
             ),
         )
         try:
@@ -560,6 +558,18 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             self._record_prediction(turn, AMDReason.REUSED)
         self._prediction_changed.set()
         self._update_idle()
+        if (
+            activity is not None
+            and isinstance(activity.llm, llm.RealtimeModel)
+            and not activity.llm.capabilities.user_transcription
+            and activity.stt is None
+            and turn_transcript.transcript
+        ):
+            message = llm.ChatMessage(
+                role="user", content=[turn_transcript.transcript], transcript_confidence=0.0
+            )
+            activity.agent._chat_ctx.insert(message)
+            self._session._conversation_item_added(message)
         return _AMDTurnHooks(self, turn.turn_id)
 
     def _on_agent_state_changed(self, event: AgentStateChangedEvent) -> None:

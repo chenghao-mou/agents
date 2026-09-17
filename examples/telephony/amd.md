@@ -92,8 +92,8 @@ The LLM must support required function calls. AMD uses a `record_result` tool
 for each prediction or menu result. It validates the tool arguments against the
 result schema. This tool is not added to the active Agent.
 
-With a pipeline LLM, the first non-empty final transcript selects the source for
-the whole AMD run.
+When session STT is configured, the first non-empty final transcript selects the
+source for the whole AMD run. Without session STT, AMD uses its own STT directly.
 Empty and interim results cannot win. AMD keeps using the selected source across
 turns, so a change in relative STT latency cannot discard trailing transcript segments.
 If session STT wins, AMD closes its optional STT stream and stops sending audio to it.
@@ -126,16 +126,18 @@ event with `reason="reused"`, so every committed turn produces one event.
 
 OpenAI Realtime can generate AMD replies when AgentSession controls turn detection.
 Configure this before starting the session. AMD rejects server-side turn detection,
-automatic tool replies, and models without per-response tool selection. Keep
-realtime user transcription enabled so suppressed turns remain in session history.
-AMD rejects realtime models with user transcription disabled.
+automatic tool replies, and models without per-response tool selection.
+
+Native user transcription is optional. While AMD is active and native
+transcription is disabled, committed turns use session STT for text history,
+or AMD STT if session STT is not configured.
 
 Supply a separate text LLM for classification and either session STT or AMD STT.
 Realtime input transcription alone arrives after the audio commit, too late for
 AMD's current turn. STT supplies the transcript; EOT commits the turn. The realtime
 model still receives audio for its replies.
 
-When AMD has its own STT, it uses that stream without racing session transcripts.
+AMD races its STT against session transcripts only when session STT is configured.
 Pass `stt=None` to AMD to reuse session STT instead.
 
 ```python
@@ -280,8 +282,7 @@ To place an outbound call, also set
 ## Current limits
 
 - Realtime requires session or AMD STT, a separate text classifier, client-side
-  turn detection, user transcription, per-response tool selection, and
-  client-controlled tool replies.
+  turn detection, per-response tool selection, and client-controlled tool replies.
 - Agent handoff during AMD is not supported.
 - No audio-based hold detection.
 - Session-level `ivr_detection` cannot run alongside AMD. Entry raises if it is enabled.
