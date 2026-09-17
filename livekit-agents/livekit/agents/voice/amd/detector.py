@@ -850,7 +850,7 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
 
     # endregion
 
-    # region: timeout and
+    # region: timeouts and deadlines
 
     def _check_hard_timeout(self) -> bool:
         if self._hard_deadline is not None and time.monotonic() >= self._hard_deadline:

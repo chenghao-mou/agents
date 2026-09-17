@@ -43,5 +43,5 @@ class TurnHooks(Protocol):
 
     def on_agent_turn_committed(self, handle: SpeechHandle) -> None:
         """Observe agent's reply handle after it is created or adopted for output.
-        Userful for voicemail playout tracking."""
+        Useful for voicemail playout tracking."""
         ...

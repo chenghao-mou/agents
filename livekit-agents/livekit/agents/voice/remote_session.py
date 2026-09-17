@@ -504,7 +504,8 @@ class SessionHost:
                     new_state=new_pb,
                 )
             ),
-            # NOTE: backward compat change: it was using backdated created_at before
+            # keep the wire timestamp backdated to the speech boundary; the session event
+            # used to set created_at to this value and now carries it in speech_timestamp
             created_at=(
                 event.speech_timestamp if event.speech_timestamp is not None else event.created_at
             ),
