@@ -212,9 +212,11 @@ menu extraction.
 Accepted predictions update the category and emit an event immediately. Replies
 to screening, voicemail, and IVR wait for 1.5 seconds of continuous participant
 silence. Silence before EOT and during classification counts toward the threshold.
-Human and `uncertain` replies use normal EOT timing. An unavailable result ends AMD.
-New speech pauses reply authorization. Speech end restarts the silence wait for
-the already committed turn, even if the new speech produces no accepted turn.
+Human and initial `uncertain` replies use normal EOT timing. An unavailable result ends AMD.
+Before reply authorization, new speech restarts the silence wait for the committed
+turn, even if the new speech produces no accepted turn. After authorization,
+AgentSession handles speech, silence, and interruptions. The next committed turn
+pauses authorization until AMD decides whether to reply.
 A new EOT uses the accepted category even if the previous reply is still waiting.
 Empty turns reuse pending inference or the current category. AMD retains earlier
 transcripts. Superseded requests cannot emit predictions or authorize old replies.

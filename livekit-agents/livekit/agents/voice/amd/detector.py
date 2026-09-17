@@ -279,7 +279,6 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
         self._lifecycle = AMDLifecycle.INITIALIZED
         self._completion_reason = AMDReason.CANCELLED
         self._previous_stage: AMDCategory | None = None
-        self._previous_turn: AMDCategory | None = None
         self._had_machine_stage = False
         self._state = AMDCategory.UNCERTAIN
         self._category = AMDCategory.UNCERTAIN  # latest accepted prediction, may be wait
@@ -496,8 +495,6 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             else 0
         )
         if event.new_state == "speaking":
-            if activity := self._session._activity:
-                activity._pause_authorization()
             self._speech_started_at = now - delay
             self._speech_ended_at = None
             self._speech_since_commit = True
@@ -616,8 +613,6 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
         if reason is not AMDReason.REUSED:
             # reused events repeat this one, so completion keeps the classified turn
             self._latest = event
-        if reason is AMDReason.PREDICTION:
-            self._previous_turn = event.prev_turn_category
         # Empty turns committed during inference reuse its result, each with its own event.
         # A non-empty commit would have cancelled this inference already.
         events = [event]
@@ -1053,7 +1048,7 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             reason=self._completion_reason,
             turn_id=self._latest.turn_id if self._latest else self._turn_id,
             transcript=self._latest.transcript if self._latest else "",
-            prev_turn_category=self._previous_turn,
+            prev_turn_category=self._latest.prev_turn_category if self._latest else None,
             prev_stage_category=self._previous_stage,
             voicemail_message_played=self._voicemail_message_played,
         )

@@ -183,6 +183,58 @@ async def test_reply_waits_for_classification_and_silence() -> None:
         await asyncio.wait_for(handles[0], 2)
 
 
+async def test_untranscribed_speech_does_not_revoke_reply_authorization() -> None:
+    async with running(machine_silence_threshold=0.5, turn_detection="vad") as (
+        detector,
+        session,
+        classifier,
+        rt,
+    ):
+        handle = await reply(session, classifier, rt, AMDCategory.MACHINE_SCREENING)
+        activity = session._activity
+        recognition = activity._audio_recognition
+        output = session.output.audio
+        await asyncio.wait_for(recognition._vad_atask, 2)
+        await recognition._on_vad_event(
+            vad.VADEvent(
+                type=vad.VADEventType.START_OF_SPEECH,
+                samples_index=0,
+                timestamp=0,
+                speech_duration=0,
+                silence_duration=0,
+            )
+        )
+        respond(rt)
+        await asyncio.sleep(0.1)
+        assert not handle.done()
+        assert output.captured_playout_segments == 0
+
+        await recognition._on_vad_event(
+            vad.VADEvent(
+                type=vad.VADEventType.END_OF_SPEECH,
+                samples_index=0,
+                timestamp=0,
+                speech_duration=0.1,
+                silence_duration=0,
+            )
+        )
+        await asyncio.wait_for(handle, 0.2)
+        assert not handle.interrupted
+        assert output.captured_playout_segments == 1
+        assert detector.lifecycle is AMDLifecycle.ACTIVE
+        assert detector._turn_id == 1
+        assert classifier.requests.empty()
+
+        assert activity.on_end_of_turn(end_of_turn("Please hold."))
+        await classifier.request()
+        assert not activity._authorization_allowed.is_set()
+        assert rt.generate_reply_calls == 1
+        classifier.prediction(2, AMDCategory.WAIT)
+        await asyncio.wait_for(activity._user_turn_completed_atask, 2)
+        assert rt.generate_reply_calls == 1
+        assert output.captured_playout_segments == 1
+
+
 async def test_stage_instructions_expire_after_first_human_reply() -> None:
     async with running() as (_, session, classifier, rt):
         for category, instructions in (

@@ -36,8 +36,8 @@ A busy person is not automatically machine-unavailable. A screener is not an IVR
 Menu instructions after voicemail can be machine-ivr. A person taking over can be human.
 
 Allowed next categories are supplied with each request. If new evidence is inconclusive,
-return uncertain. This reopens all categories on the next turn.
-Wait skips the current turn's reply, keeps listening, and allows any category on the next turn.
+return uncertain. Both uncertain and wait keep the current stage and its allowed next categories.
+Wait skips the current turn's reply and keeps listening.
 If the participant asks for a spoken answer or keypad choice, classify that prompt instead.
 Do not infer hold music from the transcript.
 Classify a brief conversational greeting after a sent digit selects a person as human,

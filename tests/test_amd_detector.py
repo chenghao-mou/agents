@@ -511,6 +511,12 @@ async def test_fallback_prediction_has_the_current_previous_category(reason: str
         assert not fallback.state_changed
         assert fallback.model_dump()["state_changed"] is False
 
+        await detector.aclose()
+        completed = await detector.execute()
+        latest = first if reason == "reused" else fallback
+        assert completed.turn_id == latest.turn_id
+        assert completed.prev_turn_category == latest.prev_turn_category
+
 
 @pytest.mark.asyncio
 async def test_customer_hook_and_prediction_overlap_controls_are_temporary() -> None:
