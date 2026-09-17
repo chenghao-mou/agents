@@ -38,10 +38,14 @@ class AMDRacingSTT:
         self,
         model: stt.STT | None,
         conn_options: APIConnectOptions,
+        *,
+        race_session: bool = True,
     ) -> None:
         self._model = model
         self._conn_options = conn_options
         self._source: AMDTranscriptSource | None = "session" if model is None else None
+        if model is not None and not race_session:
+            self._source = "amd"
         self._current = AMDTurnTranscriptAccumulator()
         self._stream: stt.RecognizeStream | None = None
 

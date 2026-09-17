@@ -76,7 +76,7 @@ the session. Set the SIP answer timeout when placing the call. The detection
   LLM. A model instance or string selects a different classification and menu model.
 - `stt` accepts `str | STT | None | NotGiven`. If omitted, AMD auto-selects
   `cartesia/ink-whisper`. Pass `None` to use only the session transcript.
-  A model instance or string selects a second STT for AMD only.
+  A model instance or string selects an STT for AMD only.
 - Model strings use LiveKit Inference. Provider plugins can use the caller's
   own provider credentials.
 - AMD closes models it creates from strings. It does not close supplied model
@@ -92,7 +92,8 @@ The LLM must support required function calls. AMD uses a `record_result` tool
 for each prediction or menu result. It validates the tool arguments against the
 result schema. This tool is not added to the active Agent.
 
-The first non-empty final transcript selects the source for the whole AMD run.
+With a pipeline LLM, the first non-empty final transcript selects the source for
+the whole AMD run.
 Empty and interim results cannot win. AMD keeps using the selected source across
 turns, so a change in relative STT latency cannot discard trailing transcript segments.
 If session STT wins, AMD closes its optional STT stream and stops sending audio to it.
@@ -120,6 +121,47 @@ includes those transcripts and successful DTMF tool calls and results.
 An empty EOT keeps useful pending classification for the latest turn. Older AMD
 reply waits exit immediately. Reusing a prediction emits an `amd_prediction`
 event with `reason="reused"`, so every committed turn produces one event.
+
+## Realtime models
+
+OpenAI Realtime can generate AMD replies when AgentSession controls turn detection.
+Configure this before starting the session. AMD rejects server-side turn detection,
+automatic tool replies, and models without per-response tool selection. Keep
+realtime user transcription enabled so suppressed turns remain in session history.
+AMD rejects realtime models with user transcription disabled.
+
+Supply a separate text LLM for classification and either session STT or AMD STT.
+Realtime input transcription alone arrives after the audio commit, too late for
+AMD's current turn. STT supplies the transcript; EOT commits the turn. The realtime
+model still receives audio for its replies.
+
+When AMD has its own STT, it uses that stream without racing session transcripts.
+Pass `stt=None` to AMD to reuse session STT instead.
+
+```python
+from livekit.agents import AMD, Agent, AgentSession
+from livekit.plugins import openai, silero
+
+session = AgentSession(
+    llm=openai.realtime.RealtimeModel(turn_detection=None),
+    vad=silero.VAD.load(),
+    turn_handling={"turn_detection": "vad"},
+)
+await session.start(Agent(instructions="Call about an appointment."), room=ctx.room)
+
+async with AMD(
+    session,
+    llm="google/gemini-3.1-flash-lite",
+    stt="cartesia/ink-whisper",
+    participant_identity=callee_identity,
+) as detector:
+    # Create the SIP participant here, as in the example above.
+    result = await detector.execute()
+```
+
+AMD sends stage instructions with each authorized response and its tool follow-ups.
+These instructions do not change the realtime session's base instructions or saved
+history. The DTMF tool is available only to IVR replies and their tool follow-ups.
 
 ## Stage behavior
 
@@ -237,7 +279,9 @@ To place an outbound call, also set
 
 ## Current limits
 
-- Pipeline STT/LLM/TTS only. Realtime reply control is not implemented.
+- Realtime requires session or AMD STT, a separate text classifier, client-side
+  turn detection, user transcription, per-response tool selection, and
+  client-controlled tool replies.
 - Agent handoff during AMD is not supported.
 - No audio-based hold detection.
 - Session-level `ivr_detection` cannot run alongside AMD. Entry raises if it is enabled.
