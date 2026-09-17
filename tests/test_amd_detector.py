@@ -42,48 +42,39 @@ from livekit.agents.voice.audio_recognition import (
 from livekit.agents.voice.events import FunctionToolsExecutedEvent, UserInputTranscribedEvent
 from livekit.agents.voice.speech_handle import SpeechHandle
 
-from .amd_test_utils import detector_clock  # noqa: F401
+from .amd_test_utils import detector_clock, next_deadline  # noqa: F401
 from .fake_io import FakeAudioOutput
 from .fake_llm import FakeLLM, FakeLLMResponse
-from .fake_stt import DrainingStream, DrainingSTT
+from .fake_stt import DrainingStream, DrainingSTT, FakeSTT
 from .fake_tts import FakeTTS
 
 pytestmark = [pytest.mark.unit, pytest.mark.no_concurrent, pytest.mark.virtual_time]
 
 
-@pytest.mark.parametrize(
-    ("category", "previous", "changed"),
-    [
-        (AMDCategory.UNCERTAIN, None, False),
-        (AMDCategory.HUMAN, None, True),
-        (AMDCategory.MACHINE_VM, None, True),
-        (AMDCategory.MACHINE_VM, AMDCategory.UNCERTAIN, True),
-        (AMDCategory.MACHINE_VM, AMDCategory.MACHINE_VM, False),
-        (AMDCategory.MACHINE_IVR, AMDCategory.MACHINE_VM, True),
-        (AMDCategory.HUMAN, AMDCategory.MACHINE_IVR, True),
-    ],
-)
-def test_prediction_state_changed_is_derived(
-    category: AMDCategory, previous: AMDCategory | None, changed: bool
-) -> None:
+def test_prediction_event_carries_stage_and_state_changed() -> None:
     event = AMDPredictionEvent(
-        category=category,
-        prev_turn_category=previous,
-        prev_stage_category=AMDCategory.UNCERTAIN,
+        category=AMDCategory.WAIT,
         reason="prediction",
         transcript="hello",
         speech_duration=0,
         delay=0,
     )
-    assert event.state_changed is changed
-    assert event.model_dump()["state_changed"] is changed
-    assert json.loads(event.model_dump_json())["state_changed"] is changed
-    assert "state_changed" not in AMDPredictionEvent.model_fields
+    assert event.stage is AMDCategory.UNCERTAIN
+    assert event.state_changed is False
+    dumped = json.loads(event.model_dump_json())
+    assert dumped["stage"] == "uncertain"
+    assert dumped["state_changed"] is False
 
-    event.prev_turn_category = category
-    assert not event.state_changed
-    event.category = AMDCategory.HUMAN if category != AMDCategory.HUMAN else AMDCategory.MACHINE_IVR
-    assert event.state_changed
+    event = AMDPredictionEvent(
+        category=AMDCategory.MACHINE_VM,
+        stage=AMDCategory.MACHINE_VM,
+        state_changed=True,
+        prev_turn_category=AMDCategory.UNCERTAIN,
+        reason="prediction",
+        transcript="hello",
+        speech_duration=0,
+        delay=0,
+    )
     assert event.model_dump()["state_changed"] is True
 
 
@@ -276,16 +267,23 @@ async def eventually(predicate: Any) -> None:
 
 @asynccontextmanager
 async def running(
-    *, classifier: ClassifierLLM | None = None, agent: CustomerAgent | None = None, **options: Any
+    *,
+    classifier: ClassifierLLM | None = None,
+    agent: CustomerAgent | None = None,
+    session_options: dict[str, Any] | None = None,
+    **options: Any,
 ) -> AsyncIterator[tuple[AMD, AgentSession, ClassifierLLM, RecordingLLM]]:
     classifier = classifier or ClassifierLLM()
     agent = agent or CustomerAgent()
     model = RecordingLLM()
     session = AgentSession(
-        llm=model,
-        tts=FakeTTS(fake_audio_duration=0.05),
-        turn_handling={"turn_detection": "manual"},
-        aec_warmup_duration=None,
+        **{
+            "llm": model,
+            "tts": FakeTTS(fake_audio_duration=0.05),
+            "turn_handling": {"turn_detection": "manual"},
+            "aec_warmup_duration": None,
+            **(session_options or {}),
+        }
     )
     session.output.audio = FakeAudioOutput()
     await session.start(agent)
@@ -504,7 +502,7 @@ async def test_fallback_prediction_has_the_current_previous_category(reason: str
         await asyncio.wait_for(detector._should_reply(2, llm.ChatContext()), 2)
         fallback = detector._turns[2].prediction
         assert fallback is not None
-        assert len(events) == (1 if reason == "reused" else 2)
+        assert len(events) == 2
         assert fallback.reason == reason
         assert fallback.category == fallback.prev_turn_category == AMDCategory.MACHINE_VM
         assert fallback.prev_stage_category == AMDCategory.UNCERTAIN
@@ -800,18 +798,18 @@ async def test_voicemail_handle_commit_does_not_signal_a_prediction_or_update_id
 async def test_voicemail_idle_defaults_to_one_minute_after_playback() -> None:
     async with running() as (detector, session, classifier, model):
         loop = asyncio.get_running_loop()
-        assert detector._next_deadline is not None
-        assert detector._next_deadline - loop.time() == pytest.approx(10, abs=0.1)
+        assert next_deadline(detector) is not None
+        assert next_deadline(detector) - loop.time() == pytest.approx(10, abs=0.1)
         await commit(detector, session, classifier, reply=True)
         classifier.prediction(1, AMDCategory.MACHINE_VM)
         await asyncio.wait_for(model.calls.get(), 2)
         await eventually(
             lambda: detector._voicemail_message_played and session._activity._no_pending_speech
         )
-        assert detector._next_deadline is not None
-        assert detector._next_deadline - loop.time() == pytest.approx(60, abs=0.1)
+        assert next_deadline(detector) is not None
+        assert next_deadline(detector) - loop.time() == pytest.approx(60, abs=0.1)
         await detector.aclose()
-        assert detector._next_deadline is None
+        assert next_deadline(detector) is None
 
 
 @pytest.mark.asyncio
@@ -828,14 +826,14 @@ async def test_late_post_voicemail_menu_uses_the_normal_ivr_idle_timeout() -> No
         await eventually(
             lambda: detector._voicemail_message_played and session._activity._no_pending_speech
         )
-        voicemail_deadline = detector._next_deadline
+        voicemail_deadline = next_deadline(detector)
         assert voicemail_deadline is not None
         await asyncio.sleep(0.06)
         assert detector.lifecycle is AMDLifecycle.ACTIVE
 
         speech_started(detector)
-        assert detector._next_deadline is not None
-        assert detector._next_deadline > voicemail_deadline
+        assert next_deadline(detector) is not None
+        assert next_deadline(detector) > voicemail_deadline
         speech_ended(detector, 0)
         menu = (
             "To replay your message, press 1. To continue recording, press 2. "
@@ -876,17 +874,17 @@ async def test_late_prediction_preserves_stage_and_idle_timer(category: AMDCateg
         assert await first.should_reply(llm.ChatContext())
         second = await commit(detector, session, classifier)
         await second.should_reply(llm.ChatContext())
-        deadline = detector._next_deadline
+        deadline = next_deadline(detector)
         classifier.prediction(2, category)
         await asyncio.sleep(0)
         assert classifier.responses[2].cancelled()
         assert events[-1].reason == "inference_timeout"
         assert len(events) == 2
         assert detector._state == previous
-        assert detector._next_deadline == deadline
-        assert detector._next_deadline is not None
+        assert next_deadline(detector) == deadline
+        assert next_deadline(detector) is not None
         expected = 2 if previous == AMDCategory.MACHINE_VM else 1
-        assert detector._next_deadline - asyncio.get_running_loop().time() == pytest.approx(
+        assert next_deadline(detector) - asyncio.get_running_loop().time() == pytest.approx(
             expected, abs=0.1
         )
 
@@ -899,7 +897,7 @@ async def test_voicemail_idle_does_not_extend_the_hard_timeout() -> None:
         result = await asyncio.wait_for(detector.execute(), 2)
         assert result.category == AMDCategory.MACHINE_VM
         assert result.reason == "timeout"
-        assert detector._next_deadline is None
+        assert next_deadline(detector) is None
 
 
 @pytest.mark.asyncio
@@ -1180,7 +1178,7 @@ async def test_nonterminal_finish_releases_a_waiter_without_a_prediction(reason:
         await asyncio.wait_for(waiter, 2)
         assert detector._turns[1].prediction is None
         assert events == []
-        assert detector._next_deadline is None
+        assert next_deadline(detector) is None
 
 
 @pytest.mark.asyncio
@@ -1203,7 +1201,7 @@ async def test_timeout_rearms_and_late_result_cannot_change_a_newer_turn() -> No
         hooks = await commit(detector, session, classifier)
         assert await hooks.should_reply(llm.ChatContext())
         assert events[-1].reason == "inference_timeout"
-        assert detector._next_deadline is not None
+        assert next_deadline(detector) is not None
         await commit(detector, session, classifier)
         classifier.prediction(1, AMDCategory.MACHINE_VM)
         assert classifier.responses[1].cancelled()
@@ -1234,7 +1232,29 @@ async def test_invalid_model_output_falls_back_and_releases_the_reply() -> None:
         assert detector._turns[1].prediction.reason == "inference_error"
         assert detector._state == AMDCategory.UNCERTAIN
         assert detector.lifecycle is AMDLifecycle.ACTIVE
-        assert detector._next_deadline is not None
+        assert next_deadline(detector) is not None
+
+
+@pytest.mark.asyncio
+async def test_amd_commits_short_turns_during_agent_speech() -> None:
+    session_options = {
+        "stt": FakeSTT(),
+        "turn_handling": {"turn_detection": "stt", "interruption": {"min_words": 3}},
+    }
+    async with running(session_options=session_options) as (detector, session, _, _):
+        activity = session._activity
+        assert activity is not None
+        speech = SpeechHandle.create(allow_interruptions=True)
+        activity._current_speech = speech
+        # AMD classifies every turn, so the min_words filter does not drop a short one
+        assert activity.on_end_of_turn(end_of_turn("hi"))
+        assert detector._turn_id == 1
+        assert detector._turns[1].transcript.transcript == "hi"
+        speech._mark_done()
+        activity._current_speech = None
+        await detector.aclose()
+        # without AMD the same short turn is dropped
+        assert not activity.on_end_of_turn(end_of_turn("hi"))
 
 
 @pytest.mark.asyncio
@@ -1431,7 +1451,7 @@ async def test_sip_answer_gating_and_early_media(
             if wait_until_answered:
                 await asyncio.sleep(5.1)
                 assert detector.lifecycle is AMDLifecycle.PENDING
-                assert detector._next_deadline is None
+                assert next_deadline(detector) is None
                 answered.set()
             else:
                 answer_mock.assert_not_called()
@@ -1804,7 +1824,7 @@ async def test_dtmf_on_an_empty_turn_is_context_not_an_inference_trigger() -> No
 
 
 @pytest.mark.asyncio
-async def test_invalid_transition_falls_back_and_uncertain_reopens_categories() -> None:
+async def test_invalid_transition_falls_back_and_uncertain_keeps_the_stage() -> None:
     async with running() as (detector, session, classifier, _):
         events = []
         detector.on("amd_prediction", events.append)
@@ -1815,22 +1835,27 @@ async def test_invalid_transition_falls_back_and_uncertain_reopens_categories() 
         for turn_id, category, reason in (
             (2, AMDCategory.MACHINE_SCREENING, "inference_error"),
             (3, AMDCategory.UNCERTAIN, "prediction"),
-            (4, AMDCategory.MACHINE_SCREENING, "prediction"),
+            (4, AMDCategory.MACHINE_SCREENING, "inference_error"),
         ):
             hooks = await commit(detector, session, classifier)
             classifier.prediction(turn_id, category)
             ctx = llm.ChatContext()
-            await hooks.should_reply(ctx)
+            assert await hooks.should_reply(ctx)
             assert events[-1].reason == reason
+            assert detector._state is state
+            assert events[-1].stage is state
+            assert not events[-1].state_changed
+            # the stage instructions still apply while the stage is kept
+            assert ctx.items[-1].text_content == _DEFAULT_VOICEMAIL_INSTRUCTIONS
             if turn_id == 2:
-                assert detector._state is state
-                assert not events[-1].state_changed
-            else:
-                assert detector._state == category
-                assert events[-1].state_changed
-            if turn_id == 3:
-                assert not ctx.items
+                assert events[-1].category is AMDCategory.MACHINE_VM
+            elif turn_id == 3:
+                assert events[-1].category is AMDCategory.UNCERTAIN
+                assert events[-1].prev_turn_category is AMDCategory.MACHINE_VM
                 assert classifier.requests.empty()
+            else:
+                # a fallback keeps the latest accepted prediction
+                assert events[-1].category is AMDCategory.UNCERTAIN
 
 
 @pytest.mark.asyncio
@@ -2046,9 +2071,12 @@ async def test_delayed_deadline_cancels_reply_hold_without_repeating_effects(
         extract_menu.assert_awaited_once()
         state = detector._state
         loop = asyncio.get_running_loop()
+        timer = detector._timer
+        assert timer is not None
         with monkeypatch.context() as delayed_clock:
+            # fire the armed timer as if the loop ran it late
             delayed_clock.setattr(detector_module.time, "monotonic", lambda: loop.time() + 3)
-            detector._on_deadline()
+            timer._run()
         result = await asyncio.wait_for(detector.execute(), 2)
         assert result.reason == "timeout"
         assert result.category == AMDCategory.MACHINE_IVR
@@ -2091,7 +2119,9 @@ async def test_split_screening_rollover_retains_all_turns() -> None:
             classifier.prediction(index, category)
             await eventually(lambda turn_id=index: detector._turns[turn_id].prediction is not None)
         assert detector._state == AMDCategory.MACHINE_VM
-        assert detector._turns[4].prediction.prev_stage_category == AMDCategory.UNCERTAIN
+        assert detector._turns[4].prediction.prev_stage_category == AMDCategory.MACHINE_SCREENING
+        assert detector._turns[3].prediction.category == AMDCategory.UNCERTAIN
+        assert detector._turns[3].prediction.stage == AMDCategory.MACHINE_SCREENING
 
 
 @pytest.mark.asyncio
@@ -2256,7 +2286,7 @@ async def test_amd_enforces_overall_deadline_independently_of_fsm(pending: str) 
                     speech_started(detector)
         state = detector._state
         assert not hasattr(state, "next_deadline")
-        assert detector._next_deadline == deadline
+        assert next_deadline(detector) == deadline
         assert detector._hard_deadline == deadline
         result = await asyncio.wait_for(detector.execute(), 1)
         assert result.reason == "timeout"
@@ -2266,7 +2296,7 @@ async def test_amd_enforces_overall_deadline_independently_of_fsm(pending: str) 
         assert detector._hard_deadline is None
         assert detector._state is state
         assert not detector._reply_held_at(asyncio.get_running_loop().time())
-        assert detector._next_deadline is None
+        assert next_deadline(detector) is None
         assert detector._timer is None
         assert session.amd is None
 
@@ -2385,9 +2415,13 @@ async def test_human_instructions_remember_machine_history(bridge: AMDCategory) 
             ctx = llm.ChatContext()
             assert await hooks.should_reply(ctx) == (category is not AMDCategory.WAIT)
             if category is bridge:
-                assert not ctx.items
+                # wait blocks the reply; uncertain keeps the screening stage and its instructions
+                if bridge is AMDCategory.WAIT:
+                    assert not ctx.items
+                else:
+                    assert ctx.items[-1].extra["amd_stage"] == "machine-screening"
         assert ctx.items[-1].text_content == _DEFAULT_HUMAN_INSTRUCTIONS
-        assert (await detector.execute()).prev_stage_category == bridge
+        assert (await detector.execute()).prev_stage_category == AMDCategory.MACHINE_SCREENING
 
 
 @pytest.mark.asyncio
@@ -2411,6 +2445,7 @@ async def test_wait_skips_reply_and_allows_a_fresh_prediction(
             classifier.prediction(1, stage)
             await detector._should_reply(1, llm.ChatContext())
         previous = detector._state
+        previous_stage = detector._previous_stage
         predictions = list(events)
         transition = Mock(wraps=_fsm.transition)
         monkeypatch.setattr(_fsm, "transition", transition)
@@ -2420,10 +2455,14 @@ async def test_wait_skips_reply_and_allows_a_fresh_prediction(
         classifier.prediction(request.current_turn.extra["turn_id"], AMDCategory.WAIT)
         await asyncio.wait_for(activity._user_turn_completed_atask, 0.1)
 
-        assert detector._state is AMDCategory.WAIT
-        assert detector._previous_stage is previous
+        # wait blocks the reply but keeps the stage
+        assert detector._should_wait
+        assert detector._state is previous
+        assert detector._previous_stage is previous_stage
         assert events[:-1] == predictions
         assert events[-1].category is AMDCategory.WAIT
+        assert events[-1].stage is previous
+        assert not events[-1].state_changed
         assert not detector._reply_held_at(asyncio.get_running_loop().time())
         assert detector._voicemail_turn_id is None
         assert model.calls.empty()
@@ -2434,13 +2473,16 @@ async def test_wait_skips_reply_and_allows_a_fresh_prediction(
 
         activity.on_end_of_turn(end_of_turn())
         following = await classifier.request()
-        assert following.stage == AMDCategory.WAIT
-        assert set(following.allowed_next_categories) == set(AMDCategory)
+        assert following.stage == previous
+        assert set(following.allowed_next_categories) == set(_fsm.ALLOWED[previous])
         classifier.prediction(following.current_turn.extra["turn_id"], AMDCategory.UNCERTAIN)
-        await asyncio.wait_for(activity._user_turn_completed_atask, 0.1)
-        await asyncio.wait_for(model.calls.get(), 0.1)
+        # a kept machine stage still waits for participant silence before replying
+        await asyncio.wait_for(activity._user_turn_completed_atask, 2)
+        assert not detector._should_wait
+        assert detector._state is previous
+        await asyncio.wait_for(model.calls.get(), 2)
         assert transition.call_count == 2
-        transition.assert_called_with(AMDCategory.WAIT, AMDCategory.UNCERTAIN)
+        transition.assert_called_with(previous, AMDCategory.UNCERTAIN)
 
 
 @pytest.mark.asyncio
@@ -2459,7 +2501,9 @@ async def test_empty_turns_preserve_wait_until_new_classification(pending: bool)
         for _ in range(2):
             hooks = commit_turn(detector, end_of_turn(""))
             assert not await asyncio.wait_for(hooks.should_reply(llm.ChatContext()), 0.1)
-        assert detector._state is AMDCategory.WAIT
+            assert detector._turns[detector._turn_id].prediction.category is AMDCategory.WAIT
+        assert detector._should_wait
+        assert detector._state is AMDCategory.MACHINE_IVR
         assert classifier.requests.empty()
         hooks = await commit(detector, session, classifier)
         classifier.prediction(detector._turn_id, AMDCategory.HUMAN)
@@ -2468,10 +2512,10 @@ async def test_empty_turns_preserve_wait_until_new_classification(pending: bool)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reason", [AMDReason.IDLE_TIMEOUT, AMDReason.TIMEOUT, AMDReason.CANCELLED])
+@pytest.mark.parametrize("reason", [AMDReason.TIMEOUT, AMDReason.CANCELLED])
 async def test_wait_does_not_block_completion_or_allow_a_reply_afterward(reason: AMDReason) -> None:
     async with running(
-        idle_timeout=0.1 if reason is AMDReason.IDLE_TIMEOUT else 10,
+        idle_timeout=0.1,
         timeout=0.1 if reason is AMDReason.TIMEOUT else 10,
     ) as (detector, session, classifier, _):
         hooks = await commit(detector, session, classifier)
@@ -2481,6 +2525,27 @@ async def test_wait_does_not_block_completion_or_allow_a_reply_afterward(reason:
             await detector.aclose()
         assert (await asyncio.wait_for(detector.execute(), 0.2)).reason is reason
         assert not await hooks.should_reply(llm.ChatContext())
+
+
+@pytest.mark.asyncio
+async def test_wait_pauses_the_idle_timer_until_the_next_prediction() -> None:
+    async with running(idle_timeout=0.1) as (detector, session, classifier, _):
+        hooks = await commit(detector, session, classifier)
+        classifier.prediction(1, AMDCategory.WAIT)
+        assert not await hooks.should_reply(llm.ChatContext())
+        await asyncio.sleep(0.3)
+        assert detector.lifecycle is AMDLifecycle.ACTIVE
+        assert detector._idle_deadline is None
+        hooks = commit_turn(detector, end_of_turn(""))
+        assert not await hooks.should_reply(llm.ChatContext())
+        await asyncio.sleep(0.3)
+        assert detector.lifecycle is AMDLifecycle.ACTIVE
+
+        hooks = await commit(detector, session, classifier)
+        classifier.prediction(3, AMDCategory.UNCERTAIN)
+        assert await hooks.should_reply(llm.ChatContext())
+        assert detector._idle_deadline is not None
+        assert (await asyncio.wait_for(detector.execute(), 1)).reason is AMDReason.IDLE_TIMEOUT
 
 
 @pytest.mark.asyncio

@@ -2669,8 +2669,10 @@ class AgentActivity(RecognitionHooks):
             return True
 
         # avoid interruption if the new_transcript is too short
+        # AMD classifies every turn, so short turns are committed while it runs
         if (
             self.stt is not None
+            and self._session._amd is None
             and self._turn_detection != "manual"
             and self._current_speech is not None
             and self._current_speech.allow_interruptions

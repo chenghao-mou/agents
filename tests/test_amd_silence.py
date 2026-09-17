@@ -12,7 +12,7 @@ from livekit.agents import AMD, Agent, AgentSession, UserStateChangedEvent, llm,
 from livekit.agents.voice.amd import AMDCategory, AMDLifecycle, _inference
 from livekit.agents.voice.speech_handle import SpeechHandle
 
-from .amd_test_utils import detector_clock  # noqa: F401
+from .amd_test_utils import detector_clock, next_deadline  # noqa: F401
 from .fake_io import FakeAudioOutput
 from .fake_llm import FakeLLM
 from .fake_stt import DrainingSTT, FakeSTT
@@ -79,7 +79,7 @@ async def test_machine_prediction_updates_state_before_reply_silence(category: A
             return
         assert detector.lifecycle is AMDLifecycle.ACTIVE
         assert detector._reply_held_at(asyncio.get_running_loop().time())
-        assert detector._next_deadline - asyncio.get_running_loop().time() == pytest.approx(
+        assert next_deadline(detector) - asyncio.get_running_loop().time() == pytest.approx(
             0.1, abs=0.01
         )
         await asyncio.sleep(0.11)
@@ -119,7 +119,7 @@ async def test_elapsed_silence_and_slow_inference_do_not_add_another_wait() -> N
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reason", ["prediction", "inference_timeout", "inference_error", "reused"])
-async def test_machine_fallbacks_wait_but_uncertain_replies_normally(reason: str) -> None:
+async def test_machine_fallbacks_and_uncertain_keep_the_silence_wait(reason: str) -> None:
     async with running(machine_silence_threshold=1.5, inference_timeout=0.2) as (
         detector,
         session,
@@ -148,18 +148,18 @@ async def test_machine_fallbacks_wait_but_uncertain_replies_normally(reason: str
         await asyncio.sleep(0.9)
         prediction = detector._turns[2].prediction
         assert prediction is not None
-        assert len(events) == (0 if reason == "reused" else 1)
+        assert len(events) == 1
         assert prediction.reason == reason
-        if reason == "prediction":
-            assert prediction.category == AMDCategory.UNCERTAIN
-            assert reply.done() and reply.result()
-            assert not ctx.items
-        else:
-            assert prediction.category == AMDCategory.MACHINE_SCREENING
-            assert not prediction.state_changed
-            assert not reply.done()
+        # uncertain keeps the screening stage, so its reply waits for silence too
+        assert prediction.category == (
+            AMDCategory.UNCERTAIN if reason == "prediction" else AMDCategory.MACHINE_SCREENING
+        )
+        assert prediction.stage == AMDCategory.MACHINE_SCREENING
+        assert not prediction.state_changed
+        assert not reply.done()
         await asyncio.sleep(0.11)
         assert await reply
+        assert ctx.items[-1].extra["amd_stage"] == "machine-screening"
         assert classifier.requests.empty()
 
 
@@ -227,8 +227,8 @@ async def test_untranscribed_speech_rearms_the_committed_prediction(source: str)
             await asyncio.sleep(0.5)
             assert detector._turns[1].prediction is not None
             assert detector._reply_held_at(asyncio.get_running_loop().time())
-            assert detector._next_deadline is not None
-            assert detector._next_deadline - asyncio.get_running_loop().time() == pytest.approx(
+            assert next_deadline(detector) is not None
+            assert next_deadline(detector) - asyncio.get_running_loop().time() == pytest.approx(
                 1.0, abs=0.01
             )
 
@@ -377,7 +377,7 @@ async def test_late_machine_prediction_cannot_replace_an_empty_turn_hold() -> No
         assert activity.on_end_of_turn(end_of_turn(""))
         reply_task = activity._user_turn_completed_atask
         assert reply_task is not None
-        release_at = detector._next_deadline
+        release_at = next_deadline(detector)
         assert release_at is not None
         assert detector._turn_id == 3
         assert detector._turns[3].prediction.reason == "reused"
@@ -385,7 +385,7 @@ async def test_late_machine_prediction_cannot_replace_an_empty_turn_hold() -> No
         await asyncio.sleep(0.4)
         classifier.prediction(2, AMDCategory.MACHINE_UNAVAILABLE)
         await asyncio.sleep(0.1)
-        assert detector._next_deadline == release_at
+        assert next_deadline(detector) == release_at
         assert detector._turns[2].prediction is fallback
         assert fallback.model_dump() == fallback_snapshot
 
@@ -395,6 +395,7 @@ async def test_late_machine_prediction_cannot_replace_an_empty_turn_hold() -> No
         assert [(event.turn_id, event.reason) for event in events] == [
             (1, "prediction"),
             (2, "inference_timeout"),
+            (3, "reused"),
         ]
         await asyncio.sleep(0.11)
         assert detector._state == AMDCategory.MACHINE_VM
@@ -405,6 +406,7 @@ async def test_late_machine_prediction_cannot_replace_an_empty_turn_hold() -> No
         assert [(event.turn_id, event.reason) for event in events] == [
             (1, "prediction"),
             (2, "inference_timeout"),
+            (3, "reused"),
         ]
         await asyncio.wait_for(reply_task, 2)
         assert model.calls.empty()
@@ -467,11 +469,13 @@ async def test_empty_eot_after_resumed_speech_rearms_a_useful_prediction(
         commit_turn(detector, end_of_turn(""))
         if not inference_ready:
             classifier.prediction(1, AMDCategory.MACHINE_SCREENING)
+        # an empty turn committed after the prediction reuses it and emits a reused event
+        expected = [(1, "prediction")] + ([(2, "reused")] if inference_ready else [])
         await asyncio.sleep(0.9)
-        assert [(e.turn_id, e.reason) for e in events] == [(1, "prediction")]
+        assert [(e.turn_id, e.reason) for e in events] == expected
         assert detector._reply_held_at(asyncio.get_running_loop().time())
         await asyncio.sleep(0.11)
-        assert [(e.turn_id, e.reason) for e in events] == [(1, "prediction")]
+        assert [(e.turn_id, e.reason) for e in events] == expected
         assert detector._turns[2].prediction is not None
         assert classifier.requests.empty()
 
@@ -486,7 +490,7 @@ async def test_empty_turn_does_not_delay_the_next_prediction() -> None:
         stream = push_audio(detector, stt)
         speech_ended(detector, 0)
         commit_turn(detector, end_of_turn(""))
-        assert events == []
+        assert [(e.turn_id, e.reason) for e in events] == [(1, "reused")]
         assert detector._turns[1].prediction.reason == "reused"
 
         await asyncio.sleep(0.1)
@@ -498,11 +502,12 @@ async def test_empty_turn_does_not_delay_the_next_prediction() -> None:
         classifier.prediction(2, AMDCategory.MACHINE_SCREENING)
 
         await asyncio.sleep(0.5)
-        assert len(events) == 1
+        assert len(events) == 2
         assert detector._reply_held_at(asyncio.get_running_loop().time())
         await asyncio.sleep(1.01)
         assert [(event.turn_id, event.category) for event in events] == [
-            (2, AMDCategory.MACHINE_SCREENING)
+            (1, AMDCategory.UNCERTAIN),
+            (2, AMDCategory.MACHINE_SCREENING),
         ]
         assert not stream.flushed.is_set()
         assert await hooks.should_reply(llm.ChatContext())
@@ -531,8 +536,8 @@ async def test_new_inference_discards_stale_turn_waits() -> None:
         assert detector._turns[3].prediction.reason == "reused"
         classifier.prediction(4, AMDCategory.MACHINE_SCREENING)
         await fourth.should_reply(llm.ChatContext())
-        assert detector._next_deadline is not None
-        assert detector._next_deadline - asyncio.get_running_loop().time() == pytest.approx(
+        assert next_deadline(detector) is not None
+        assert next_deadline(detector) - asyncio.get_running_loop().time() == pytest.approx(
             10, abs=0.01
         )
 
@@ -570,7 +575,7 @@ async def test_late_machine_prediction_does_not_postpone_idle_timeout() -> None:
         classifier.prediction(1, AMDCategory.MACHINE_SCREENING)
         await asyncio.wait_for(replies[0], 2)
         await asyncio.sleep(0)
-        release_at = detector._next_deadline
+        release_at = next_deadline(detector)
         assert release_at is not None
         await asyncio.sleep(0.2)
         assert detector.lifecycle is AMDLifecycle.FINISHED
@@ -824,7 +829,7 @@ async def test_completion_cancels_silence_wait_and_releases_waiters(reason: str)
         classifier.prediction(1, AMDCategory.MACHINE_VM)
         await eventually(
             lambda: (
-                detector._next_deadline is not None and detector._next_deadline > committed_at + 0.4
+                next_deadline(detector) is not None and next_deadline(detector) > committed_at + 0.4
             )
         )
         waiter = asyncio.create_task(detector._should_reply(1, llm.ChatContext()))
@@ -837,7 +842,7 @@ async def test_completion_cancels_silence_wait_and_releases_waiters(reason: str)
             detector._on_disconnected(SimpleNamespace(identity="callee"))
         assert (await detector.execute()).reason == reason
         await asyncio.wait_for(waiter, 2)
-        assert detector._next_deadline is None
+        assert next_deadline(detector) is None
         await asyncio.sleep(1.6)
         assert detector._turns[1].prediction.category == AMDCategory.MACHINE_VM
         assert [e.category for e in events] == [AMDCategory.MACHINE_VM]

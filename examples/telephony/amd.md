@@ -10,6 +10,9 @@ At each accepted EOT, AgentSession notifies AMD internally before
 `on_user_turn_completed` runs. AMD owns its turn IDs and returns turn hooks
 bound to that turn. Preemptive generation prepares reply tools but only commits
 an agent turn if its reply is accepted for output.
+While AMD is active, AgentSession commits every turn. It skips the
+`min_words` interruption filter, so a short transcript during agent speech
+still reaches AMD. False-interruption pause and resume stay unchanged.
 State events carry the accepted speech-boundary time,
 including the STT timestamp when STT controls turn detection.
 
@@ -115,26 +118,33 @@ A new turn can cancel classification work without discarding its transcript.
 AMD keeps its selected transcripts in an independent chat context. The next request
 includes those transcripts and successful DTMF tool calls and results.
 An empty EOT keeps useful pending classification for the latest turn. Older AMD
-reply waits exit immediately. Reusing a prediction does not emit another event.
+reply waits exit immediately. Reusing a prediction emits an `amd_prediction`
+event with `reason="reused"`, so every committed turn produces one event.
 
 ## Stage behavior
 
 | Prediction | Reply behavior | AMD lifecycle |
 | --- | --- | --- |
-| `uncertain` | Permit normal reply handling. | Reopen all categories for the next turn. |
-| `wait` | Skip the reply to an advertisement, promotion, or request to keep waiting. | Keep listening; allow any category on the next turn. |
+| `uncertain` | Before a machine stage, permit normal reply handling. In a machine stage, keep that stage's reply rule. | Keep the current stage. |
+| `wait` | Skip the reply to an advertisement, promotion, or request to keep waiting. | Keep the current stage and pause the idle timer. |
 | `machine-screening` | Answer the screener's latest question briefly. | Continue listening for the next turn. |
 | `machine-vm` | Deliver one complete, uninterrupted message. | Keep listening during and after playback. |
 | `machine-ivr` | Use the actual prompt to choose DTMF or a spoken response. | Continue listening for the next turn. |
 | `human` | After a machine stage, supply temporary human instructions. Otherwise use normal Agent instructions. | Complete AMD. |
 | `machine-unavailable` | Cancel held replies; do not generate a machine reply. | Complete AMD. |
 
-`wait` is a nonterminal category. It emits a prediction event and skips the current
-reply without a silence wait or menu extraction. Empty turns and inference failures
-reuse `wait`; the next transcribed turn gets a fresh classification. A valid `wait`
-prediction resets the inference-timeout and consecutive-uncertain counters.
-Idle and overall limits still apply. AMD completes on a human prediction, so it does
-not classify later advertisements after that handoff.
+`uncertain` and `wait` are per-turn predictions, not stages. Each
+`amd_prediction` event carries both the `category` predicted for the turn and the
+`stage` AMD keeps after it. `state_changed` is true only when the stage changes.
+The stage constrains the classifier's allowed categories for the next turn, so
+an uncertain turn in voicemail cannot jump to screening.
+
+`wait` skips the current reply without a silence wait or menu extraction. While
+the latest prediction is `wait`, the idle timer is paused; the overall `timeout`
+still applies. Empty turns and inference failures reuse `wait`; the next
+transcribed turn gets a fresh classification. A valid `wait` prediction resets
+the inference-timeout and consecutive-uncertain counters. AMD completes on a
+human prediction, so it does not classify later advertisements after that handoff.
 
 Stage instructions are temporary. They do not enter the Agent's saved history.
 Use `screening_instructions`, `voicemail_instructions`, `ivr_instructions`, and
@@ -146,8 +156,8 @@ The customer hook runs before AMD adds its instructions.
 
 The normal interruption path handles a person who speaks during a message.
 Interruption does not itself authorize a reply. AMD still checks the next turn.
-An uncertain prediction moves the category to `uncertain`. The current turn gets
-a normal reply. AMD classifies again on the next transcribed turn.
+An uncertain prediction keeps the current stage and its reply rule. AMD
+classifies again on the next transcribed turn.
 
 The FSM accepts classification results and returns the next category and effects.
 Its allowed transitions also constrain the classifier's output schema. AMD owns
@@ -195,7 +205,7 @@ or execute the observed menu. Extraction has a 5-second deadline and at most
 | `idle_timeout` | 10 seconds | Complete after inactivity outside voicemail. |
 | `voicemail_idle_timeout` | 60 seconds | Allow a delayed post-message menu after playback. |
 | `timeout` | 120 seconds | Fixed overall limit from the start of listening. |
-| `max_uncertain_turns` | 3 | Complete after consecutive uncertain model predictions. |
+| `max_uncertain_turns` | 3 | Complete with the current stage after this many consecutive uncertain predictions. Any other valid prediction, including `wait`, resets the count. |
 | `max_inference_timeouts` | 3 | Complete after this many prediction timeouts. A valid prediction resets the count. |
 
 At the inference deadline, AMD cancels the request and keeps the current stage.
@@ -230,6 +240,7 @@ To place an outbound call, also set
 - Pipeline STT/LLM/TTS only. Realtime reply control is not implemented.
 - Agent handoff during AMD is not supported.
 - No audio-based hold detection.
+- Session-level `ivr_detection` cannot run alongside AMD. Entry raises if it is enabled.
 - The remote-session protocol maps screening to `AMD_UNKNOWN`. Full v2
   prediction, menu, and completion fields still need protocol support.
 - Classification quality needs repeated model evals. Unit tests prove routing,

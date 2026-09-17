@@ -1,13 +1,17 @@
-"""Call-category transitions. AMD executes effects and owns the run's lifecycle."""
+"""Call-category transitions. AMD executes effects and owns the run's lifecycle.
+
+``uncertain`` and ``wait`` are per-turn predictions, not stages. They keep the
+current stage, so the allowed next categories stay constrained by that stage.
+"""
 
 from dataclasses import dataclass
 from enum import Enum, auto
 
 from .events import AMDCategory
 
+# wait does not change the state
 ALLOWED = {
     AMDCategory.UNCERTAIN: frozenset(AMDCategory),
-    AMDCategory.WAIT: frozenset(AMDCategory),
     AMDCategory.MACHINE_SCREENING: frozenset(
         {
             AMDCategory.MACHINE_SCREENING,
@@ -62,5 +66,7 @@ def transition(state: AMDCategory, prediction: AMDCategory) -> Transition:
             return Transition(prediction, (Effect.COMPLETE,))
         case AMDCategory.MACHINE_IVR:
             return Transition(prediction, (Effect.EXTRACT_MENU,))
+        case AMDCategory.UNCERTAIN | AMDCategory.WAIT:
+            return Transition(state)
         case _:
             return Transition(prediction)

@@ -144,7 +144,6 @@ async def test_classifier_requires_exactly_one_result_tool(names: list[str]) -> 
         AMDCategory.MACHINE_SCREENING,
         AMDCategory.MACHINE_VM,
         AMDCategory.MACHINE_IVR,
-        AMDCategory.WAIT,
     ],
 )
 @pytest.mark.parametrize("category", list(AMDCategory))

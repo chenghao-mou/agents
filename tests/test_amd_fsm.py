@@ -18,12 +18,14 @@ def test_transition_is_repeatable_and_does_not_mutate_input() -> None:
     assert first.effects == ()
 
 
-@pytest.mark.parametrize("current", list(Category))
+STAGES = [c for c in Category if c is not Category.WAIT]
+
+
+@pytest.mark.parametrize("current", STAGES)
 @pytest.mark.parametrize("category", list(Category))
 def test_stage_transitions(current: Category, category: Category) -> None:
     allowed = {
         Category.UNCERTAIN: set(Category),
-        Category.WAIT: set(Category),
         Category.MACHINE_SCREENING: {
             Category.MACHINE_SCREENING,
             Category.HUMAN,
@@ -58,7 +60,10 @@ def test_stage_transitions(current: Category, category: Category) -> None:
             fsm.transition(state, event)
         return
     result = fsm.transition(state, event)
-    assert result.next_state is category
+    if category in {Category.UNCERTAIN, Category.WAIT}:
+        assert result.next_state is current
+    else:
+        assert result.next_state is category
     if category in {Category.HUMAN, Category.MACHINE_UNAVAILABLE}:
         assert result.effects == (fsm.Effect.COMPLETE,)
     elif category is Category.MACHINE_IVR:
@@ -76,17 +81,17 @@ def test_stage_transitions(current: Category, category: Category) -> None:
     ],
 )
 @pytest.mark.parametrize("bridge", [Category.UNCERTAIN, Category.WAIT])
-def test_wait_and_uncertain_reopen_transitions(
+def test_wait_and_uncertain_keep_the_stage(
     initial: Category, corrected: Category, bridge: Category
 ) -> None:
     state = initial
     with pytest.raises(ValueError, match="invalid AMD transition"):
         fsm.transition(state, corrected)
     intermediate = fsm.transition(state, bridge)
-    assert intermediate.next_state is bridge
+    assert intermediate.next_state is initial
     assert intermediate.effects == ()
-    result = fsm.transition(intermediate.next_state, corrected)
-    assert result.next_state is corrected
+    with pytest.raises(ValueError, match="invalid AMD transition"):
+        fsm.transition(intermediate.next_state, corrected)
 
 
 def test_same_ivr_state_extracts_each_menu() -> None:

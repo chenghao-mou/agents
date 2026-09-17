@@ -127,7 +127,10 @@ class _AMDTurnHooks:
 
     async def should_reply(self, chat_ctx: llm.ChatContext) -> bool:
         if self._turn_id is None:
-            return self._amd._state not in {AMDCategory.MACHINE_UNAVAILABLE, AMDCategory.WAIT}
+            return (
+                self._amd._state is not AMDCategory.MACHINE_UNAVAILABLE
+                and not self._amd._should_wait
+            )
         decision = await self._amd._should_reply(self._turn_id, chat_ctx)
         self._track_voicemail = decision.track_voicemail
         return decision.allow
@@ -182,9 +185,10 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
         inference_timeout: Prediction deadline per committed turn. Late results are ignored.
         machine_silence_threshold: Continuous participant silence before a machine
             reply is authorized. Includes silence before and during classification.
-            Predictions update the category immediately. Uncertain replies do not wait.
-            Set to zero to disable the extra silence wait.
-        max_uncertain_turns: Consecutive uncertain predictions before completion.
+            Predictions update the category immediately. Replies outside a machine
+            stage do not wait. Set to zero to disable the extra silence wait.
+        max_uncertain_turns: Consecutive uncertain predictions before completion
+            with the current stage. A wait prediction resets the count.
         max_inference_timeouts: Prediction timeouts before completion. A valid
             prediction resets the count.
     """
@@ -272,6 +276,8 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
         self._previous_turn: AMDCategory | None = None
         self._had_machine_stage = False
         self._state = AMDCategory.UNCERTAIN
+        self._category = AMDCategory.UNCERTAIN  # latest accepted prediction, may be wait
+        self._should_wait = False
         self._chat_ctx = AMDChatContext()
         self._turns: dict[int, Turn] = {}
         self._turn_id = 0
@@ -325,9 +331,9 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
         if self._session.amd:
             raise RuntimeError("amd is already active")
         if self._session.options.ivr_detection or self._session._ivr_activity is not None:
-            raise ValueError("disable session-level ivr_detection when using AMD")
+            raise ValueError("please disable session-level ivr_detection when using AMD")
 
-        model = self._llm if self._llm is not None else activity.llm
+        model = self._llm or activity.llm
         if not isinstance(model, llm.LLM):
             raise ValueError("amd requires an LLM for classification")
 
@@ -557,11 +563,18 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             task.cancel()
 
     def _record_prediction(
-        self, turn: Turn, reason: AMDReason, *, effects: tuple[_fsm.Effect, ...] = ()
+        self,
+        turn: Turn,
+        reason: AMDReason,
+        *,
+        effects: tuple[_fsm.Effect, ...] = (),
+        state_changed: bool = False,
     ) -> None:
         event = AMDPredictionEvent(
             turn_id=turn.turn_id,
-            category=self._state,
+            category=self._category,
+            stage=self._state,
+            state_changed=state_changed,
             reason=reason,
             transcript=turn.transcript.transcript,
             speech_duration=turn.speech_duration,
@@ -572,10 +585,10 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             voicemail_message_played=self._voicemail_message_played,
         )
         # Empty turns committed during inference share its result.
+        # non-empty turn commit should have cancelled stale ones already
         for turn_id in range(turn.turn_id, self._turn_id + 1):
             self._turns[turn_id].prediction = event
-        if reason is AMDReason.REUSED:
-            return
+
         self._latest = event
         if reason is AMDReason.PREDICTION:
             self._previous_turn = event.prev_turn_category
@@ -650,16 +663,24 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
 
             def _accept_prediction(turn: Turn, category: AMDCategory) -> None:
                 result = _fsm.transition(self._state, category)
-                if result.next_state != self._state:
+                state_changed = result.next_state != self._state
+                if state_changed:
                     self._previous_stage = self._state
                     self._idle_deadline = None
                 self._state = result.next_state
+                self._category = category
+                self._should_wait = category is AMDCategory.WAIT
                 self._had_machine_stage |= self._state in _MACHINE_CATEGORIES
                 self._inference_timeouts = 0
                 self._uncertain_turns = (
                     self._uncertain_turns + 1 if category is AMDCategory.UNCERTAIN else 0
                 )
-                self._record_prediction(turn, AMDReason.PREDICTION, effects=result.effects)
+                self._record_prediction(
+                    turn,
+                    AMDReason.PREDICTION,
+                    effects=result.effects,
+                    state_changed=state_changed,
+                )
 
             _accept_prediction(turn, category)
 
@@ -744,7 +765,7 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
 
     def _authorize_reply(self, turn_id: int) -> ReplyDecision:
         category = self._state
-        if category is AMDCategory.WAIT:
+        if self._should_wait:
             return ReplyDecision(allow=False)
         if self.lifecycle is AMDLifecycle.FINISHED:
             human_after_machine = category is AMDCategory.HUMAN and self._had_machine_stage
@@ -800,7 +821,8 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
         prediction = self._turns[self._turn_id].prediction
         return (
             prediction is not None
-            and prediction.category in _MACHINE_CATEGORIES
+            and not self._should_wait
+            and self._state in _MACHINE_CATEGORIES
             and (
                 self._session.user_state == "speaking"
                 or self._speech_ended_at is None
@@ -869,17 +891,6 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             self._inference_timeouts += 1
             self._record_prediction(turn, AMDReason.INFERENCE_TIMEOUT)
 
-    def _on_deadline(self) -> None:
-        if self.lifecycle is not AMDLifecycle.ACTIVE or self._check_hard_timeout():
-            return
-        now = time.monotonic()
-        if self._inference_deadline is not None and now >= self._inference_deadline:
-            self._timeout_inference()
-        elif self._idle_deadline is not None and now >= self._idle_deadline:
-            self._finish(AMDReason.IDLE_TIMEOUT)
-        self._prediction_changed.set()
-        self._update_idle()
-
     def _update_idle(self) -> None:
         if self.lifecycle is not AMDLifecycle.ACTIVE or self._check_hard_timeout():
             return
@@ -895,6 +906,7 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
         activity = self._session._activity
         busy = (
             self._pending_turn is not None
+            or self._should_wait  # hold music or an advertisement; the hard timeout still applies
             or reply_held
             or self._session.user_state == "speaking"
             or bool(self._speeches)
@@ -912,14 +924,11 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             self._idle_deadline = now + timeout
         self._arm_timer(now=now)
 
-    @property
-    def _next_deadline(self) -> float | None:
-        return self._deadline_at(time.monotonic())
-
     def _deadline_at(self, now: float) -> float | None:
         silence_deadline = None
         if self._reply_held_at(now) and self._speech_ended_at is not None:
             silence_deadline = self._speech_ended_at + self._options.machine_silence_threshold
+
         return min(
             (
                 at
@@ -939,8 +948,20 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             self._timer.cancel()
             self._timer = None
         if (at := self._deadline_at(now if now is not None else time.monotonic())) is not None:
+
+            def _on_deadline() -> None:
+                if self.lifecycle is not AMDLifecycle.ACTIVE or self._check_hard_timeout():
+                    return
+                now = time.monotonic()
+                if self._inference_deadline is not None and now >= self._inference_deadline:
+                    self._timeout_inference()
+                elif self._idle_deadline is not None and now >= self._idle_deadline:
+                    self._finish(AMDReason.IDLE_TIMEOUT)
+                self._prediction_changed.set()
+                self._update_idle()
+
             self._timer = asyncio.get_running_loop().call_later(
-                max(0, at - time.monotonic()), self._on_deadline
+                max(0, at - time.monotonic()), _on_deadline
             )
 
     # endregion

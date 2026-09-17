@@ -39,6 +39,8 @@ class AMDRequest:
 
 
 class AMDChatContext(llm.ChatContext):
+    """A thin wrapper to track only user transcript and DTMF events."""
+
     def add_transcript(self, turn: Turn) -> None:
         self.add_message(
             role="user",
