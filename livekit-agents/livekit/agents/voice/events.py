@@ -314,6 +314,8 @@ class UserStateChangedEvent(BaseModel):
     type: Literal["user_state_changed"] = "user_state_changed"
     old_state: UserState
     new_state: UserState
+    speech_timestamp: float | None = None
+    """Unix time of user speech start or end, often backdated, when known."""
     created_at: float = Field(default_factory=time.time)
 
 
