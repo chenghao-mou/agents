@@ -7,6 +7,7 @@ from .events import AMDCategory
 
 ALLOWED = {
     AMDCategory.UNCERTAIN: frozenset(AMDCategory),
+    AMDCategory.WAIT: frozenset(AMDCategory),
     AMDCategory.MACHINE_SCREENING: frozenset(
         {
             AMDCategory.MACHINE_SCREENING,
@@ -14,6 +15,7 @@ ALLOWED = {
             AMDCategory.MACHINE_VM,
             AMDCategory.MACHINE_UNAVAILABLE,
             AMDCategory.UNCERTAIN,
+            AMDCategory.WAIT,
         }
     ),
     AMDCategory.MACHINE_VM: frozenset(
@@ -23,6 +25,7 @@ ALLOWED = {
             AMDCategory.MACHINE_IVR,
             AMDCategory.MACHINE_UNAVAILABLE,
             AMDCategory.UNCERTAIN,
+            AMDCategory.WAIT,
         }
     ),
     AMDCategory.MACHINE_IVR: frozenset(
@@ -32,6 +35,7 @@ ALLOWED = {
             AMDCategory.MACHINE_VM,
             AMDCategory.MACHINE_UNAVAILABLE,
             AMDCategory.UNCERTAIN,
+            AMDCategory.WAIT,
         }
     ),
     AMDCategory.HUMAN: frozenset(),

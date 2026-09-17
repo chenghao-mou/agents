@@ -31,11 +31,14 @@ machine-screening: an automated call screener asks who is calling or why, or scr
 machine-vm: a voicemail greeting asks the caller to leave or record a message.
 machine-ivr: an automated menu asks for a spoken choice or DTMF, or navigates a phone system.
 machine-unavailable: the call is rejected or cannot continue, such as a disconnected number.
+wait: an advertisement, promotion, or request to keep waiting that needs no response.
 A busy person is not automatically machine-unavailable. A screener is not an IVR menu.
 Menu instructions after voicemail can be machine-ivr. A person taking over can be human.
 
 Allowed next categories are supplied with each request. If new evidence is inconclusive,
 return uncertain. This reopens all categories on the next turn.
+Wait skips the current turn's reply, keeps listening, and allows any category on the next turn.
+If the participant asks for a spoken answer or keypad choice, classify that prompt instead.
 Do not infer hold music from the transcript.
 Classify a brief conversational greeting after a sent digit selects a person as human,
 unless the current transcript provides evidence of automation.
@@ -53,6 +56,10 @@ After screening: "Okay." then "They can't take the call." then "Feel free to lea
 -> machine-ivr, not screening.
 "Hello, can you hear me? Yes, let's schedule that."
 -> human.
+"While you wait, learn about our special offers. Save twenty percent this month."
+-> wait.
+"Please hold while I connect your call."
+-> wait.
 """
 
 MENU_PROMPT = """Extract observed IVR menu from current turn's transcript.

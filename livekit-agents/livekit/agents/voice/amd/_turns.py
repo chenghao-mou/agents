@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .events import AMDCategory, AMDPredictionEvent
 
@@ -19,11 +19,19 @@ class AMDTranscript:
     source: AMDTranscriptSource | None
 
 
-class AMDTurnContext(BaseModel):
+@dataclass
+class PredictionSlot:
+    result: AMDPredictionEvent | None = None
+
+
+class Turn(BaseModel):
     turn_id: int
-    transcript: str
-    transcript_source: AMDTranscriptSource | None
+    committed_at: float = Field(exclude=True)
+    transcript: AMDTranscript
+    speech_duration: float = Field(exclude=True)
     dtmf_digits: str
+    prediction: PredictionSlot = Field(default_factory=PredictionSlot, exclude=True)
+    inference_duration: float | None = Field(default=None, exclude=True)
 
 
 class AMDClassifyRequest(BaseModel):
@@ -31,33 +39,9 @@ class AMDClassifyRequest(BaseModel):
 
     stage: AMDCategory
     allowed_next_categories: list[AMDCategory]
-    current_turn: AMDTurnContext
-    earlier_turns: list[AMDTurnContext]
+    current_turn: Turn
+    earlier_turns: list[Turn]
     speech_duration: float
-
-
-@dataclass
-class PredictionSlot:
-    result: AMDPredictionEvent | None = None
-
-
-@dataclass
-class Turn:
-    turn_id: int
-    committed_at: float
-    transcript: AMDTranscript
-    speech_duration: float
-    dtmf_digits: str
-    prediction: PredictionSlot = field(default_factory=PredictionSlot)
-    inference_duration: float | None = None
-
-    def context(self) -> AMDTurnContext:
-        return AMDTurnContext(
-            turn_id=self.turn_id,
-            transcript=self.transcript.transcript,
-            transcript_source=self.transcript.source,
-            dtmf_digits=self.dtmf_digits,
-        )
 
 
 @dataclass
@@ -123,7 +107,13 @@ class Turns:
         self._pending_dtmf_digits = ""
 
     def commit(self, transcript: AMDTranscript, speech_duration: float, now: float) -> Turn:
-        turn = Turn(self.turn_id + 1, now, transcript, speech_duration, self._pending_dtmf_digits)
+        turn = Turn(
+            turn_id=self.turn_id + 1,
+            committed_at=now,
+            transcript=transcript,
+            speech_duration=speech_duration,
+            dtmf_digits=self._pending_dtmf_digits,
+        )
         self._pending_dtmf_digits = ""
         self._turns[turn.turn_id] = turn
         return turn
@@ -135,7 +125,7 @@ class Turns:
         return AMDClassifyRequest(
             stage=stage,
             allowed_next_categories=allowed,
-            current_turn=turn.context(),
-            earlier_turns=[t.context() for t in earlier[-_HISTORY_LIMIT:]],
+            current_turn=turn,
+            earlier_turns=earlier[-_HISTORY_LIMIT:],
             speech_duration=turn.speech_duration,
         )

@@ -11,7 +11,7 @@ from pydantic import ValidationError
 from livekit.agents import llm
 from livekit.agents.llm.tool_context import get_raw_function_info
 from livekit.agents.voice.amd import _inference
-from livekit.agents.voice.amd._turns import AMDClassifyRequest, AMDTurnContext
+from livekit.agents.voice.amd._turns import AMDClassifyRequest, AMDTranscript, Turn
 from livekit.agents.voice.amd.events import AMDCategory
 
 from .fake_llm import FakeLLM, FakeLLMResponse
@@ -21,8 +21,12 @@ pytestmark = [pytest.mark.unit, pytest.mark.no_concurrent]
 REQUEST = AMDClassifyRequest(
     stage=AMDCategory.UNCERTAIN,
     allowed_next_categories=sorted(AMDCategory),
-    current_turn=AMDTurnContext(
-        turn_id=1, transcript="input", transcript_source=None, dtmf_digits=""
+    current_turn=Turn(
+        turn_id=1,
+        committed_at=0,
+        transcript=AMDTranscript("input", None),
+        speech_duration=0.5,
+        dtmf_digits="",
     ),
     earlier_turns=[],
     speech_duration=0.5,
@@ -146,6 +150,7 @@ async def test_classifier_requires_exactly_one_result_tool(names: list[str]) -> 
         AMDCategory.MACHINE_SCREENING,
         AMDCategory.MACHINE_VM,
         AMDCategory.MACHINE_IVR,
+        AMDCategory.WAIT,
     ],
 )
 @pytest.mark.parametrize("category", list(AMDCategory))

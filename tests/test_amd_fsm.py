@@ -23,12 +23,14 @@ def test_transition_is_repeatable_and_does_not_mutate_input() -> None:
 def test_stage_transitions(current: Category, category: Category) -> None:
     allowed = {
         Category.UNCERTAIN: set(Category),
+        Category.WAIT: set(Category),
         Category.MACHINE_SCREENING: {
             Category.MACHINE_SCREENING,
             Category.HUMAN,
             Category.MACHINE_VM,
             Category.MACHINE_UNAVAILABLE,
             Category.UNCERTAIN,
+            Category.WAIT,
         },
         Category.MACHINE_VM: {
             Category.MACHINE_VM,
@@ -36,6 +38,7 @@ def test_stage_transitions(current: Category, category: Category) -> None:
             Category.MACHINE_IVR,
             Category.MACHINE_UNAVAILABLE,
             Category.UNCERTAIN,
+            Category.WAIT,
         },
         Category.MACHINE_IVR: {
             Category.MACHINE_IVR,
@@ -43,6 +46,7 @@ def test_stage_transitions(current: Category, category: Category) -> None:
             Category.MACHINE_VM,
             Category.MACHINE_UNAVAILABLE,
             Category.UNCERTAIN,
+            Category.WAIT,
         },
         Category.HUMAN: set(),
         Category.MACHINE_UNAVAILABLE: set(),
@@ -71,14 +75,17 @@ def test_stage_transitions(current: Category, category: Category) -> None:
         (Category.MACHINE_IVR, Category.MACHINE_SCREENING),
     ],
 )
-def test_uncertain_reopens_transitions(initial: Category, corrected: Category) -> None:
+@pytest.mark.parametrize("bridge", [Category.UNCERTAIN, Category.WAIT])
+def test_wait_and_uncertain_reopen_transitions(
+    initial: Category, corrected: Category, bridge: Category
+) -> None:
     state = initial
     with pytest.raises(ValueError, match="invalid AMD transition"):
         fsm.transition(state, corrected)
-    uncertain = fsm.transition(state, Category.UNCERTAIN)
-    assert uncertain.next_state is Category.UNCERTAIN
-    assert uncertain.effects == ()
-    result = fsm.transition(uncertain.next_state, corrected)
+    intermediate = fsm.transition(state, bridge)
+    assert intermediate.next_state is bridge
+    assert intermediate.effects == ()
+    result = fsm.transition(intermediate.next_state, corrected)
     assert result.next_state is corrected
 
 

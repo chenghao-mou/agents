@@ -182,7 +182,7 @@ async def test_resumed_speech_invalidates_release_and_preserves_history() -> Non
         assert detector._turns.prediction(1) is not None
         commit_turn(detector, end_of_turn("Hello, can you hear me?"))
         request = await classifier.request()
-        assert request.earlier_turns[0]["transcript"] == "hello"
+        assert request.earlier_turns[0]["transcript"]["transcript"] == "hello"
         assert request.stage == AMDCategory.MACHINE_VM
         assert AMDCategory.MACHINE_SCREENING not in request.allowed_next_categories
         assert not await hooks.should_reply(llm.ChatContext())

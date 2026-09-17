@@ -108,11 +108,19 @@ reply waits exit immediately. Reusing a prediction does not emit another event.
 | Prediction | Reply behavior | AMD lifecycle |
 | --- | --- | --- |
 | `uncertain` | Permit normal reply handling. | Reopen all categories for the next turn. |
+| `wait` | Skip the reply to an advertisement, promotion, or request to keep waiting. | Keep listening; allow any category on the next turn. |
 | `machine-screening` | Answer the screener's latest question briefly. | Continue listening for the next turn. |
 | `machine-vm` | Deliver one complete, uninterrupted message. | Keep listening during and after playback. |
 | `machine-ivr` | Use the actual prompt to choose DTMF or a spoken response. | Continue listening for the next turn. |
 | `human` | After a machine stage, supply temporary human instructions. Otherwise use normal Agent instructions. | Complete AMD. |
 | `machine-unavailable` | Cancel held replies; do not generate a machine reply. | Complete AMD. |
+
+`wait` is a nonterminal category. It emits a prediction event and skips the current
+reply without a silence wait or menu extraction. Empty turns and inference failures
+reuse `wait`; the next transcribed turn gets a fresh classification. A valid `wait`
+prediction resets the inference-timeout and consecutive-uncertain counters.
+Idle and overall limits still apply. AMD completes on a human prediction, so it does
+not classify later advertisements after that handoff.
 
 Stage instructions are temporary. They do not enter the Agent's saved history.
 Use `screening_instructions`, `voicemail_instructions`, `ivr_instructions`, and

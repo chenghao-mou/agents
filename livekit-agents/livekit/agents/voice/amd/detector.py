@@ -125,7 +125,7 @@ class _AMDTurnHooks:
 
     async def should_reply(self, chat_ctx: llm.ChatContext) -> bool:
         if self._turn_id is None:
-            return self._amd._state is not AMDCategory.MACHINE_UNAVAILABLE
+            return self._amd._state not in {AMDCategory.MACHINE_UNAVAILABLE, AMDCategory.WAIT}
         decision = await self._amd._should_reply(self._turn_id, chat_ctx)
         self._track_voicemail = decision.track_voicemail
         return decision.allow
@@ -690,6 +690,8 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
 
     def _authorize_reply(self, turn_id: int) -> ReplyDecision:
         category = self._state
+        if category is AMDCategory.WAIT:
+            return ReplyDecision(allow=False)
         if self.lifecycle is AMDLifecycle.FINISHED:
             human_after_machine = category is AMDCategory.HUMAN and self._had_machine_stage
             return ReplyDecision(

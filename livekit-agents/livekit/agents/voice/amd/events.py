@@ -17,6 +17,7 @@ class AMDCategory(str, Enum):
     MACHINE_SCREENING = "machine-screening"
     MACHINE_VM = "machine-vm"
     MACHINE_UNAVAILABLE = "machine-unavailable"
+    WAIT = "wait"
     UNCERTAIN = "uncertain"
 
 
