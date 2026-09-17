@@ -758,8 +758,8 @@ async def test_voicemail_handle_commit_does_not_signal_a_prediction_or_update_id
 async def test_voicemail_idle_defaults_to_one_minute_after_playback() -> None:
     async with running() as (detector, session, classifier, model):
         loop = asyncio.get_running_loop()
-        assert detector._state.next_deadline is not None
-        assert detector._state.next_deadline - loop.time() == pytest.approx(10, abs=0.1)
+        assert detector._next_deadline is not None
+        assert detector._next_deadline - loop.time() == pytest.approx(10, abs=0.1)
         await commit(detector, session, classifier, reply=True)
         classifier.prediction(1, AMDCategory.MACHINE_VM)
         await asyncio.wait_for(model.calls.get(), 2)
@@ -768,10 +768,10 @@ async def test_voicemail_idle_defaults_to_one_minute_after_playback() -> None:
                 detector._state.voicemail_message_played and session._activity._no_pending_speech
             )
         )
-        assert detector._state.next_deadline is not None
-        assert detector._state.next_deadline - loop.time() == pytest.approx(60, abs=0.1)
+        assert detector._next_deadline is not None
+        assert detector._next_deadline - loop.time() == pytest.approx(60, abs=0.1)
         await detector.aclose()
-        assert detector._state.next_deadline is None
+        assert detector._next_deadline is None
 
 
 @pytest.mark.asyncio
@@ -790,14 +790,14 @@ async def test_late_post_voicemail_menu_uses_the_normal_ivr_idle_timeout() -> No
                 detector._state.voicemail_message_played and session._activity._no_pending_speech
             )
         )
-        voicemail_deadline = detector._state.next_deadline
+        voicemail_deadline = detector._next_deadline
         assert voicemail_deadline is not None
         await asyncio.sleep(0.06)
         assert detector.lifecycle is AMDLifecycle.ACTIVE
 
         speech_started(detector)
-        assert detector._state.next_deadline is not None
-        assert detector._state.next_deadline > voicemail_deadline
+        assert detector._next_deadline is not None
+        assert detector._next_deadline > voicemail_deadline
         speech_ended(detector, 0)
         menu = (
             "To replay your message, press 1. To continue recording, press 2. "
@@ -838,17 +838,17 @@ async def test_late_prediction_preserves_stage_and_idle_timer(category: AMDCateg
         assert await first.should_reply(llm.ChatContext())
         second = await commit(detector, session, classifier)
         await second.should_reply(llm.ChatContext())
-        deadline = detector._state.next_deadline
+        deadline = detector._next_deadline
         classifier.prediction(2, category)
         await asyncio.sleep(0)
         assert classifier.responses[2].cancelled()
         assert events[-1].reason == "inference_timeout"
         assert len(events) == 2
         assert detector._state.category == previous
-        assert detector._state.next_deadline == deadline
-        assert detector._state.next_deadline is not None
+        assert detector._next_deadline == deadline
+        assert detector._next_deadline is not None
         expected = 2 if previous == AMDCategory.MACHINE_VM else 1
-        assert detector._state.next_deadline - asyncio.get_running_loop().time() == pytest.approx(
+        assert detector._next_deadline - asyncio.get_running_loop().time() == pytest.approx(
             expected, abs=0.1
         )
 
@@ -861,7 +861,7 @@ async def test_voicemail_idle_does_not_extend_the_hard_timeout() -> None:
         result = await asyncio.wait_for(detector.execute(), 2)
         assert result.category == AMDCategory.MACHINE_VM
         assert result.reason == "timeout"
-        assert detector._state.next_deadline is None
+        assert detector._next_deadline is None
 
 
 @pytest.mark.asyncio
@@ -1142,7 +1142,7 @@ async def test_nonterminal_finish_releases_a_waiter_without_a_prediction(reason:
         await asyncio.wait_for(waiter, 2)
         assert detector._turns.prediction(1) is None
         assert events == []
-        assert detector._state.next_deadline is None
+        assert detector._next_deadline is None
 
 
 @pytest.mark.asyncio
@@ -1165,7 +1165,7 @@ async def test_timeout_rearms_and_late_result_cannot_change_a_newer_turn() -> No
         hooks = await commit(detector, session, classifier)
         assert await hooks.should_reply(llm.ChatContext())
         assert events[-1].reason == "inference_timeout"
-        assert detector._state.next_deadline is not None
+        assert detector._next_deadline is not None
         await commit(detector, session, classifier)
         classifier.prediction(1, AMDCategory.MACHINE_VM)
         assert classifier.responses[1].cancelled()
@@ -1196,7 +1196,7 @@ async def test_invalid_model_output_falls_back_and_releases_the_reply() -> None:
         assert detector._turns.prediction(1).reason == "inference_error"
         assert detector._state.category == AMDCategory.UNCERTAIN
         assert detector.lifecycle is AMDLifecycle.ACTIVE
-        assert detector._state.next_deadline is not None
+        assert detector._next_deadline is not None
 
 
 @pytest.mark.asyncio
@@ -1337,7 +1337,7 @@ async def test_sip_answer_gating_and_early_media(
             room_io.set_participant.assert_called_once_with("callee")
             if wait_until_answered:
                 assert detector.lifecycle is AMDLifecycle.PENDING
-                assert detector._state.next_deadline is None
+                assert detector._next_deadline is None
                 answered.set()
             else:
                 answer_mock.assert_not_called()
@@ -1927,18 +1927,16 @@ async def test_delayed_deadline_does_not_start_menu_after_completion(
         classifier.prediction(1, AMDCategory.MACHINE_IVR)
         await asyncio.sleep(0.01)
         assert detector._turns.prediction(1) is None
-        assert detector._state.next_deadline is not None
+        assert detector._next_deadline is not None
         loop = asyncio.get_running_loop()
-        assert detector._state.next_deadline - loop.time() == pytest.approx(1.49, abs=0.01)
+        assert detector._next_deadline - loop.time() == pytest.approx(1.49, abs=0.01)
         with monkeypatch.context() as delayed_clock:
             delayed_clock.setattr(detector_module.time, "monotonic", lambda: loop.time() + 3)
             detector._on_deadline()
         result = await asyncio.wait_for(detector.execute(), 2)
         assert result.reason == "timeout"
-        assert result.category == AMDCategory.MACHINE_IVR
-        assert [(event.turn_id, event.category) for event in events] == [
-            (1, AMDCategory.MACHINE_IVR)
-        ]
+        assert result.category == AMDCategory.UNCERTAIN
+        assert events == []
         extract_menu.assert_not_called()
 
 
@@ -2114,3 +2112,35 @@ async def test_classifier_history_is_bounded_and_saved_decisions_survive() -> No
         assert all(turn["transcript"] == "" for turn in request.earlier_turns)
         assert detector._turns.prediction(1) is first_prediction
         assert first_prediction.category == AMDCategory.MACHINE_SCREENING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending", ["idle", "classification", "silence", "speech"])
+async def test_amd_enforces_overall_deadline_independently_of_fsm(pending: str) -> None:
+    async with running(timeout=0.3, inference_timeout=1, machine_silence_threshold=1.5) as (
+        detector,
+        session,
+        classifier,
+        _,
+    ):
+        deadline = detector._hard_deadline
+        assert deadline is not None
+        if pending != "idle":
+            await commit(detector, session, classifier)
+            if pending != "classification":
+                classifier.prediction(1, AMDCategory.MACHINE_VM)
+                await eventually(lambda: isinstance(detector._state.work, _fsm.Holding))
+                if pending == "speech":
+                    speech_started(detector)
+        policy_deadline = detector._state.next_deadline
+        assert policy_deadline is None or policy_deadline > deadline
+        assert detector._next_deadline == deadline
+        assert detector._hard_deadline == deadline
+        result = await asyncio.wait_for(detector.execute(), 1)
+        assert result.reason == "timeout"
+        assert result.category == AMDCategory.UNCERTAIN
+        assert detector._hard_deadline is None
+        assert detector._state.work is None
+        assert detector._next_deadline is None
+        assert detector._timer is None
+        assert session.amd is None

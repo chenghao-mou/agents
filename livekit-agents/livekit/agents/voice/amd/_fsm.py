@@ -1,7 +1,7 @@
 """Pure AMD policy: (state, event) -> (next state, effects).
 
-The coordinator owns turn identity, model tasks, and public events. The FSM only
-tracks call stages and pending work. All times use the same monotonic clock.
+The coordinator owns turn identity, model tasks, the overall deadline, and public
+events. The FSM tracks call stages and pending work. All times are monotonic.
 """
 
 from __future__ import annotations
@@ -60,7 +60,6 @@ class AMDLifecycle(Enum):
 class Options:
     idle_timeout: float = 10.0
     voicemail_idle_timeout: float = 60.0
-    timeout: float = 120.0
     inference_timeout: float = 1.5
     machine_silence_threshold: float = 1.5
     max_uncertain_turns: int = 3
@@ -97,7 +96,6 @@ class State:
     work: Classifying | Holding | None = None
     speaking: bool = False
     silence_since: float | None = None
-    hard_deadline: float | None = None
     idle_deadline: float | None = None
     uncertain_turns: int = 0
     inference_timeouts: int = 0
@@ -118,7 +116,7 @@ class State:
             else None
         )
         return min(
-            (at for at in (self.hard_deadline, self.idle_deadline, work_at) if at is not None),
+            (at for at in (self.idle_deadline, work_at) if at is not None),
             default=None,
         )
 
@@ -201,9 +199,7 @@ def transition(state: State, event: Event, *, now: float, options: Options) -> T
                 raise RuntimeError("use a new AMD instance for each run")
             return Transition(replace(state, lifecycle=AMDLifecycle.PENDING))
         case Signal.START if state.lifecycle is AMDLifecycle.PENDING:
-            return Transition(
-                replace(state, lifecycle=AMDLifecycle.ACTIVE, hard_deadline=now + options.timeout)
-            )
+            return Transition(replace(state, lifecycle=AMDLifecycle.ACTIVE))
         case Finish(reason):
             return _finish(state, reason)
         case Signal.REPLY_REQUESTED:
@@ -295,7 +291,6 @@ def _finish(state: State, reason: AMDReason) -> Transition:
             lifecycle=AMDLifecycle.FINISHED,
             completion_reason=reason,
             work=None,
-            hard_deadline=None,
             idle_deadline=None,
         ),
         (Action.CANCEL_CLASSIFICATION, Action.COMPLETE),
@@ -305,10 +300,7 @@ def _finish(state: State, reason: AMDReason) -> Transition:
 def _expire(state: State, now: float, options: Options) -> Transition:
     effects: list[Effect] = []
     while (at := state.next_deadline) is not None and at <= now:
-        # Hard deadline wins ties, followed by idle and pending work.
-        if at == state.hard_deadline:
-            result = _finish(state, AMDReason.TIMEOUT)
-        elif at == state.idle_deadline:
+        if at == state.idle_deadline:
             result = _finish(state, AMDReason.IDLE_TIMEOUT)
         elif isinstance(state.work, Holding):
             result = _publish(state, state.work.prediction, options)

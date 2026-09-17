@@ -228,12 +228,13 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
         self._options = _fsm.Options(
             idle_timeout=idle_timeout,
             voicemail_idle_timeout=voicemail_idle_timeout,
-            timeout=timeout,
             inference_timeout=inference_timeout,
             machine_silence_threshold=machine_silence_threshold,
             max_uncertain_turns=max_uncertain_turns,
             max_inference_timeouts=max_inference_timeouts,
         )
+        self._timeout = timeout
+        self._hard_deadline: float | None = None
         self._state = _fsm.State()
         self._turns = Turns()
         self._user_speech = SpeechWindow()
@@ -394,6 +395,7 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
     def _start_listening(self) -> None:
         if self.lifecycle is not AMDLifecycle.PENDING:
             return
+        self._hard_deadline = time.monotonic() + self._timeout
         self._dispatch(_fsm.Signal.START)
         if self._session.user_state == "speaking":
             self._user_speech.started(time.monotonic())
@@ -457,7 +459,10 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
 
     def _dispatch(self, event: _fsm.Event, *, turn: Turn | None = None) -> tuple[_fsm.Effect, ...]:
         """Complete each transition's effects before handling events raised by listeners."""
-        self._event_queue.append((event, turn, time.monotonic()))
+        now = time.monotonic()
+        if self._hard_deadline is not None and now >= self._hard_deadline:
+            self._event_queue.append((_fsm.Finish(AMDReason.TIMEOUT), None, now))
+        self._event_queue.append((event, turn, now))
         if self._dispatching:
             return ()
         self._dispatching = True
@@ -525,6 +530,8 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             notify_prediction = update_idle = True
         finally:
             self._dispatching = False
+        if self.lifecycle is AMDLifecycle.FINISHED:
+            self._hard_deadline = None
         if notify_prediction:
             self._prediction_changed.set()
         if update_idle:
@@ -762,11 +769,18 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
         ).state
         self._arm_timer()
 
+    @property
+    def _next_deadline(self) -> float | None:
+        return min(
+            (at for at in (self._hard_deadline, self._state.next_deadline) if at is not None),
+            default=None,
+        )
+
     def _arm_timer(self) -> None:
         if self._timer is not None:
             self._timer.cancel()
             self._timer = None
-        if (at := self._state.next_deadline) is not None:
+        if (at := self._next_deadline) is not None:
             self._timer = asyncio.get_running_loop().call_later(
                 max(0, at - time.monotonic()), self._on_deadline
             )

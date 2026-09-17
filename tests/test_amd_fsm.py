@@ -10,7 +10,7 @@ from livekit.agents.voice.amd.events import AMDCategory as Category, AMDReason a
 pytestmark = pytest.mark.unit
 
 OPTIONS = fsm.Options(inference_timeout=1, machine_silence_threshold=0)
-ACTIVE = fsm.State(lifecycle=fsm.AMDLifecycle.ACTIVE, hard_deadline=120)
+ACTIVE = fsm.State(lifecycle=fsm.AMDLifecycle.ACTIVE)
 
 
 def send(
@@ -43,61 +43,29 @@ def test_transition_is_repeatable_and_does_not_mutate_input() -> None:
     assert first.state.work is None
 
 
-def test_lifecycle_and_fixed_hard_deadline() -> None:
+def test_lifecycle_and_stage_idle_deadline() -> None:
     initial = fsm.State()
     pending = send(initial, fsm.Signal.ENTER).state
     assert pending.lifecycle is fsm.AMDLifecycle.PENDING
     assert send(pending, fsm.ActivityChanged(False), 3).state.next_deadline is None
     state = send(pending, fsm.Signal.START, 5).state
-    assert state.hard_deadline == 125
+    assert state.lifecycle is fsm.AMDLifecycle.ACTIVE
+    assert state.next_deadline is None
     assert send(state, fsm.Signal.START, 6).state == state
     state = send(request(state, 7), fsm.PredictionReceived(Category.MACHINE_VM), 7.1).state
     state = send(state, fsm.ActivityChanged(False), 10).state
     assert state.next_deadline == 70
     state = send(state, fsm.ActivityChanged(True), 69).state
-    assert state.next_deadline == 125
-    assert send(state, fsm.Signal.DEADLINE_REACHED, 124).state.lifecycle is fsm.AMDLifecycle.ACTIVE
-    result = send(state, fsm.Signal.DEADLINE_REACHED, 125)
+    assert state.next_deadline is None
+    state = send(state, fsm.ActivityChanged(False), 71).state
+    assert state.next_deadline == 131
+    result = send(state, fsm.Signal.DEADLINE_REACHED, 131)
     assert result.state.lifecycle is fsm.AMDLifecycle.FINISHED
     assert result.state.next_deadline is None
-    assert result.state.completion_reason is Reason.TIMEOUT
+    assert result.state.completion_reason is Reason.IDLE_TIMEOUT
     assert result.state.category is Category.MACHINE_VM
     with pytest.raises(RuntimeError, match="new AMD instance"):
         send(result.state, fsm.Signal.ENTER)
-    idle = send(ACTIVE, fsm.ActivityChanged(False)).state
-    assert (
-        send(idle, fsm.Signal.DEADLINE_REACHED, 121).state.completion_reason is Reason.IDLE_TIMEOUT
-    )
-
-
-@pytest.mark.parametrize("committed_at", [118, 119, 119.5])
-def test_delayed_timer_orders_inference_and_hard_deadline(committed_at: float) -> None:
-    result = send(request(ACTIVE, committed_at), fsm.Signal.DEADLINE_REACHED, 121)
-    assert result.state.completion_reason is Reason.TIMEOUT
-    predictions = [e.prediction for e in result.effects if isinstance(e, fsm.ReleasePrediction)]
-    assert predictions == (
-        [fsm.Prediction(Category.UNCERTAIN, Reason.INFERENCE_TIMEOUT)]
-        if committed_at == 118
-        else []
-    )
-    assert result.state.next_deadline is None
-
-
-@pytest.mark.parametrize("committed_at", [118, 118.5, 119])
-def test_delayed_timer_orders_silence_release_and_hard_deadline(committed_at: float) -> None:
-    options = replace(OPTIONS, machine_silence_threshold=1.5)
-    result = send(
-        request(ACTIVE, committed_at),
-        fsm.PredictionReceived(Category.MACHINE_UNAVAILABLE),
-        committed_at + 0.1,
-        options=options,
-    )
-    assert result.effects == ()
-    result = send(result.state, fsm.Signal.DEADLINE_REACHED, 121, options=options)
-    assert result.state.completion_reason is (
-        Reason.FINISHED if committed_at == 118 else Reason.TIMEOUT
-    )
-    assert result.state.next_deadline is None
 
 
 @pytest.mark.parametrize(
@@ -298,7 +266,7 @@ def test_speech_pauses_hold_and_end_rearms_without_a_commit() -> None:
     ).state
     state = send(state, fsm.Signal.SPEECH_STARTED, 1, options=options).state
     assert isinstance(state.work, fsm.Holding) and state.work.release_at is None
-    assert state.next_deadline == 120
+    assert state.next_deadline is None
     state = send(state, fsm.SpeechEnded(2), 2.1, options=options).state
     assert state.next_deadline == 3.5
     assert send(state, fsm.Signal.DEADLINE_REACHED, 3.4, options=options).effects == ()
