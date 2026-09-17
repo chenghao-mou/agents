@@ -438,6 +438,10 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
         if participant.identity == self._participant_identity:
             self._finish(AMDReason.PARTICIPANT_DISCONNECTED)
 
+    @property
+    def _input_audio_allowed(self) -> bool:
+        return self.lifecycle is not AMDLifecycle.PENDING
+
     def push_audio(self, frame: rtc.AudioFrame) -> None:
         if self.lifecycle is AMDLifecycle.ACTIVE:
             self._resources.stt.push_audio(frame)

@@ -1652,7 +1652,8 @@ class AgentActivity(RecognitionHooks):
     def push_audio(self, frame: rtc.AudioFrame) -> None:
         if not self._started:
             return
-        if not self._session._input_audio_allowed:
+        amd = self._session._amd
+        if amd is not None and not amd._input_audio_allowed:
             return
 
         aec_warmup_active: bool = (
@@ -1681,8 +1682,8 @@ class AgentActivity(RecognitionHooks):
         if should_discard:
             stt_frame = utils.audio.silence_frame_like(frame)
 
-        if self._session._amd is not None:
-            self._session._amd.push_audio(frame)
+        if amd is not None:
+            amd.push_audio(frame)
 
         if self._rt_session is not None:
             self._rt_session.push_audio(stt_frame if stt_frame is not None else frame)
@@ -3119,7 +3120,7 @@ class AgentActivity(RecognitionHooks):
         return not self._speech_q and (not self._current_speech or self._current_speech.done())
 
     @property
-    def _is_agent_active(self) -> bool:
+    def _is_agent_busy(self) -> bool:
         """Whether turn handling, speech, playback, or interruption recovery is pending."""
         audio_output = self._session.output.audio
         return (
