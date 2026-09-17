@@ -168,9 +168,10 @@ or execute the observed menu. Extraction has a 5-second deadline and at most
 | `max_uncertain_turns` | 3 | Complete after consecutive uncertain predictions without an established stage. |
 | `max_inference_timeouts` | 3 | Complete after this many prediction timeouts. A valid prediction resets the count. |
 
-A late prediction can update the stage if no newer inference replaced it.
-It cannot change a reply that already started. Reaching `max_inference_timeouts`
-completes AMD after the current stage's silence requirement.
+At the inference deadline, AMD cancels the request and keeps the current stage.
+Results that arrive after the deadline are ignored. The next transcribed turn
+starts a new classification. Reaching `max_inference_timeouts` completes AMD
+after the current stage's silence requirement.
 Model errors and reused results use the same stage and silence rule.
 New speech cancels the idle timer. Stage changes do not extend the overall limit.
 The overall limit can end AMD during a silence wait. Without speech-end timing,

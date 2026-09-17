@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from ... import llm
 from ...types import DEFAULT_API_CONNECT_OPTIONS, APIConnectOptions
-from ._fsm import AMDClassifyRequest
+from ._turns import AMDClassifyRequest
 from .events import AMDCategory, IVRMenuOption
 
 # TODO: @chenghao-mou improve this with evaluation

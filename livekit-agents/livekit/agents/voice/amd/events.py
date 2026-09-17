@@ -18,11 +18,6 @@ class AMDReason(str, Enum):
 
     PREDICTION = "prediction"
     """A model prediction was released normally."""
-    LATE_PREDICTION = "late_prediction"
-    """A model prediction was released after the turn's inference timeout.
-
-    It can update the stage without replacing the turn's saved prediction.
-    """
     REUSED = "reused"
     """Internal prediction for an empty turn using the current stage without a new request.
 

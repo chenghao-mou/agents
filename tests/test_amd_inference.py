@@ -11,7 +11,7 @@ from pydantic import ValidationError
 from livekit.agents import llm
 from livekit.agents.llm.tool_context import get_raw_function_info
 from livekit.agents.voice.amd import _inference
-from livekit.agents.voice.amd._fsm import AMDClassifyRequest, AMDTurnContext
+from livekit.agents.voice.amd._turns import AMDClassifyRequest, AMDTurnContext
 from livekit.agents.voice.amd.events import AMDCategory
 
 from .fake_llm import FakeLLM, FakeLLMResponse

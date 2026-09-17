@@ -10,7 +10,7 @@ from ... import stt
 from ...log import logger
 from ...types import APIConnectOptions
 from ...utils import aio
-from ._fsm import AMDTranscript, AMDTranscriptSource
+from ._turns import AMDTranscript, AMDTranscriptSource
 
 
 class AMDTurnTranscriptAccumulator:

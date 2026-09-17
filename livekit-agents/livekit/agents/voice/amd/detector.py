@@ -4,6 +4,7 @@ import asyncio
 import os
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from types import TracebackType
@@ -18,16 +19,10 @@ from ...types import NOT_GIVEN, NotGivenOr
 from ...utils import EventEmitter, aio, is_given
 from ...utils.misc import is_cloud
 from ...utils.participant import wait_for_participant_attribute, wait_for_track_publication
-from . import _inference
-from ._fsm import (
-    AMDFSM,
-    AMDClassifyRequest,
-    AMDEffect,
-    AMDLifecycle,
-    AMDMenuRequest,
-    AMDReplyDecision,
-)
+from . import _fsm, _inference
+from ._fsm import AMDLifecycle, ReplyDecision
 from ._transcription import AMDRacingSTT
+from ._turns import AMDClassifyRequest, SpeechWindow, Turn, Turns
 from .events import (
     AMDCategory,
     AMDCompletedEvent,
@@ -51,7 +46,6 @@ if TYPE_CHECKING:
 
 _DEFAULT_MAX_INFERENCE_TIMEOUTS = 3  # Allow transient delays before abandoning detection.
 _MACHINE_SILENCE_THRESHOLD = 1.5  # Wait for a pause before releasing machine predictions.
-_CLASSIFY_TIMEOUT = 3.0  # Allow late predictions, but stop stalled provider requests.
 _MENU_TIMEOUT = 5.0  # Stop optional menu work before it becomes stale.
 
 _DEFAULT_SCREENING_INSTRUCTIONS = (
@@ -106,7 +100,7 @@ class _AMDTurnHooks:
 
     async def should_reply(self, chat_ctx: llm.ChatContext) -> bool:
         if self._turn_id is None:
-            return self._amd._fsm.category is not AMDCategory.MACHINE_UNAVAILABLE
+            return self._amd._state.category is not AMDCategory.MACHINE_UNAVAILABLE
         decision = await self._amd._should_reply(self._turn_id, chat_ctx)
         self._track_voicemail = decision.track_voicemail
         return decision.allow
@@ -231,7 +225,7 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             AMDCategory.MACHINE_IVR: ivr_instructions,
             AMDCategory.HUMAN: human_instructions,
         }
-        self._fsm = AMDFSM(
+        self._options = _fsm.Options(
             idle_timeout=idle_timeout,
             voicemail_idle_timeout=voicemail_idle_timeout,
             timeout=timeout,
@@ -240,6 +234,14 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             max_uncertain_turns=max_uncertain_turns,
             max_inference_timeouts=max_inference_timeouts,
         )
+        self._state = _fsm.State()
+        self._turns = Turns()
+        self._user_speech = SpeechWindow()
+        self._pending_turn: Turn | None = None
+        self._latest: AMDPredictionEvent | None = None
+        self._voicemail_turn_id: int | None = None
+        self._event_queue: deque[tuple[_fsm.Event, Turn | None, float]] = deque()
+        self._dispatching = False
         self._session_id = uuid.uuid4().hex
         self._control_prefix = f"amd_{uuid.uuid4().hex}_"
         self._voicemail_handle: SpeechHandle | None = None
@@ -263,7 +265,7 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
     @property
     def lifecycle(self) -> AMDLifecycle:
         """Current lifecycle state of this AMD run."""
-        return self._fsm.lifecycle
+        return self._state.lifecycle
 
     async def __aenter__(self) -> AMD:
         activity = self._session._activity
@@ -278,7 +280,9 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
         model = self._llm if self._llm is not None else activity.llm
         if not isinstance(model, llm.LLM):
             raise ValueError("amd requires an LLM for classification")
-        self._fsm.enter()
+        self._state = _fsm.transition(
+            self._state, _fsm.Signal.ENTER, now=time.monotonic(), options=self._options
+        ).state
         self._run = _AMDResources(
             agent=activity.agent,
             llm=model,
@@ -390,9 +394,10 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
     def _start_listening(self) -> None:
         if self.lifecycle is not AMDLifecycle.PENDING:
             return
-        self._fsm.start(time.monotonic())
+        self._dispatch(_fsm.Signal.START)
         if self._session.user_state == "speaking":
-            self._fsm.speech_started(time.monotonic())
+            self._user_speech.started(time.monotonic())
+            self._dispatch(_fsm.Signal.SPEECH_STARTED)
         self._update_idle()
         logger.info("amd listening", extra={"session_id": self._session_id})
 
@@ -405,7 +410,8 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             self._resources.stt.push_audio(frame)
 
     def on_dtmf_event(self, digits: str) -> None:
-        self._fsm.dtmf_sent(digits)
+        if self.lifecycle in {AMDLifecycle.PENDING, AMDLifecycle.ACTIVE}:
+            self._turns.dtmf_sent(digits)
 
     def _on_user_state_changed(self, event: UserStateChangedEvent) -> None:
         if self.lifecycle is not AMDLifecycle.ACTIVE:
@@ -421,9 +427,11 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
         if event.new_state == "speaking":
             if activity := self._session._activity:
                 activity._pause_authorization()
-            self._apply(self._fsm.speech_started(now - delay))
+            self._user_speech.started(now - delay)
+            self._dispatch(_fsm.Signal.SPEECH_STARTED)
         elif event.old_state == "speaking":
-            self._apply(self._fsm.speech_ended(now, delay))
+            self._user_speech.ended(now - delay)
+            self._dispatch(_fsm.SpeechEnded(now - delay))
 
     def _on_user_input_transcribed(self, event: UserInputTranscribedEvent) -> None:
         if self.lifecycle is AMDLifecycle.ACTIVE and event.is_final:
@@ -437,45 +445,119 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
         if activity := self._session._activity:
             activity._pause_authorization()
         turn_transcript = self._resources.stt.end_turn(transcript)
-        effects = self._fsm.commit_turn(turn_transcript, time.monotonic(), end_of_turn_delay or 0)
-        turn_id = self._fsm.turn_id
-        self._apply(effects)
-        return _AMDTurnHooks(self, turn_id)
+        now = time.monotonic()
+        duration = self._user_speech.commit(now, end_of_turn_delay or 0)
+        turn = self._turns.commit(turn_transcript, duration, now)
+        self._voicemail_turn_id = None
+        self._dispatch(
+            _fsm.TurnCommitted(bool(turn_transcript.transcript), self._user_speech.silence_since),
+            turn=turn,
+        )
+        return _AMDTurnHooks(self, turn.turn_id)
 
-    def _apply(self, effects: list[AMDEffect]) -> None:
-        """Carry out the effects of one FSM transition, then re-arm the timer."""
-        completed = False
+    def _dispatch(self, event: _fsm.Event, *, turn: Turn | None = None) -> tuple[_fsm.Effect, ...]:
+        """Complete each transition's effects before handling events raised by listeners."""
+        self._event_queue.append((event, turn, time.monotonic()))
+        if self._dispatching:
+            return ()
+        self._dispatching = True
+        effects: tuple[_fsm.Effect, ...] = ()
+        notify_prediction = False
+        update_idle = False
         try:
-            for effect in effects:
-                if isinstance(effect, AMDClassifyRequest):
-                    self._start_classification(effect)
-                elif isinstance(effect, AMDMenuRequest):
-                    if self.lifecycle is AMDLifecycle.ACTIVE:
-                        self._menu_atask = self._spawn(
-                            self._extract_menu(effect.turn_id, effect.transcript)
+            while self._event_queue:
+                event, turn, now = self._event_queue.popleft()
+                result = _fsm.transition(self._state, event, now=now, options=self._options)
+                self._state = result.state
+                effects = result.effects
+                notify_prediction |= isinstance(event, _fsm.TurnCommitted) or any(
+                    isinstance(effect, _fsm.ReleasePrediction) or effect is _fsm.Action.COMPLETE
+                    for effect in effects
+                )
+                update_idle |= event not in (
+                    _fsm.Signal.REPLY_REQUESTED,
+                    _fsm.Signal.REPLY_COMMITTED,
+                    _fsm.Signal.VOICEMAIL_PLAYED,
+                )
+                # Reuse keeps the original turn's timing and transcript for the release.
+                origin = self._pending_turn or turn
+                if self._state.work is not None:
+                    self._pending_turn = origin
+                for effect in effects:
+                    if effect is _fsm.Action.CANCEL_CLASSIFICATION:
+                        self._cancel_classification()
+                    elif effect is _fsm.Action.CLASSIFY:
+                        assert turn is not None
+                        self._pending_turn = origin = turn
+                        request = self._turns.request(
+                            turn,
+                            stage=self._state.category,
+                            allowed=sorted(_fsm.ALLOWED[self._state.category]),
                         )
-                elif isinstance(effect, AMDCompletedEvent):
-                    completed = True
-                else:
-                    self._release_prediction(effect)
+                        if self._menu_atask is not None:
+                            self._menu_atask.cancel()
+                        self._classifier_task = self._spawn(self._classify(turn, request))
+                    elif effect is _fsm.Action.REUSE_PENDING_PREDICTION:
+                        assert turn is not None and origin is not None
+                        turn.prediction = origin.prediction
+                    elif isinstance(effect, _fsm.ReleasePrediction):
+                        assert origin is not None
+                        self._record_prediction(origin, effect, now)
+                        self._pending_turn = None
+                    elif effect is _fsm.Action.EXTRACT_MENU:
+                        assert origin is not None
+                        if self.lifecycle is AMDLifecycle.ACTIVE:
+                            self._menu_atask = self._spawn(
+                                self._extract_menu(origin.turn_id, origin.transcript.transcript)
+                            )
+                    elif effect is _fsm.Action.COMPLETE:
+                        self._pending_turn = None
+                        self._turns.clear_pending_dtmf()
         except Exception:
-            # emit() re-raises TypeError from listeners. Timer callbacks have no caller
-            # to report to, so a listener bug must still complete the run.
-            logger.exception("amd prediction release failed")
-            self._fsm.finish(AMDReason.INTERNAL_ERROR)
-            completed = True
-        self._prediction_changed.set()
-        self._update_idle()
-        if completed and self._finish_atask is None:
+            logger.exception("amd transition failed")
+            self._event_queue.clear()
+            self._state = _fsm.transition(
+                self._state,
+                _fsm.Finish(AMDReason.INTERNAL_ERROR),
+                now=time.monotonic(),
+                options=self._options,
+            ).state
+            notify_prediction = update_idle = True
+        finally:
+            self._dispatching = False
+        if notify_prediction:
+            self._prediction_changed.set()
+        if update_idle:
+            self._update_idle()
+        if self.lifecycle is AMDLifecycle.FINISHED and self._finish_atask is None:
             self._finish_atask = asyncio.create_task(self._cleanup())
+        return effects
 
-    def _start_classification(self, request: AMDClassifyRequest) -> None:
-        """Classify the turn. A new turn supersedes the previous classifier and menu work."""
-        if self._classifier_task is not None:
-            self._classifier_task.cancel()
-        if self._menu_atask is not None:
-            self._menu_atask.cancel()
-        self._classifier_task = self._spawn(self._classify(request.current_turn.turn_id, request))
+    def _cancel_classification(self) -> None:
+        task, self._classifier_task = self._classifier_task, None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    def _record_prediction(self, turn: Turn, effect: _fsm.ReleasePrediction, now: float) -> None:
+        prediction = effect.prediction
+        event = AMDPredictionEvent(
+            turn_id=turn.turn_id,
+            category=prediction.category,
+            reason=prediction.reason,
+            transcript=turn.transcript.transcript,
+            speech_duration=turn.speech_duration,
+            delay=now - turn.committed_at,
+            inference_duration=turn.inference_duration
+            if prediction.reason is AMDReason.PREDICTION
+            else None,
+            prev_turn_category=effect.previous_turn,
+            prev_stage_category=self._state.previous_stage,
+            voicemail_message_played=self._state.voicemail_message_played,
+        )
+        turn.prediction.result = event
+        if prediction.reason is not AMDReason.REUSED:
+            self._latest = event
+            self._release_prediction(event.model_copy())
 
     def _release_prediction(self, event: AMDPredictionEvent) -> None:
         if event.state_changed and (activity := self._session._activity):
@@ -492,31 +574,31 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             },
         )
 
-    async def _classify(self, turn_id: int, request: AMDClassifyRequest) -> None:
+    async def _classify(self, turn: Turn, request: AMDClassifyRequest) -> None:
         started = time.monotonic()
+        event: _fsm.Event
         try:
-            result = await asyncio.wait_for(
-                _inference.classify(
-                    self._resources.llm,
-                    request,
-                    conn_options=self._session.conn_options.llm_conn_options,
-                ),
-                _CLASSIFY_TIMEOUT,
+            result = await _inference.classify(
+                self._resources.llm,
+                request,
+                conn_options=self._session.conn_options.llm_conn_options,
             )
-        except (APIError, ValueError, asyncio.TimeoutError) as exc:
+        except Exception as exc:
+            if asyncio.current_task() is not self._classifier_task:
+                return
+            if not isinstance(exc, (APIError, ValueError, asyncio.TimeoutError)):
+                raise
             logger.warning(
                 "amd classification failed",
-                extra={"turn_id": turn_id, "error_type": type(exc).__name__},
+                extra={"turn_id": turn.turn_id, "error_type": type(exc).__name__},
             )
-            effects = self._fsm.inference_failed(turn_id, time.monotonic())
+            event = _fsm.Signal.INFERENCE_FAILED
         else:
-            now = time.monotonic()
-            effects = self._fsm.prediction_received(turn_id, result.category, now, now - started)
-            logger.debug(
-                "amd classification",
-                extra={"turn_id": turn_id, "raw_category": result.category.value},
-            )
-        self._apply(effects)
+            turn.inference_duration = time.monotonic() - started
+            event = _fsm.PredictionReceived(result.category)
+        # Cancellation is best effort. A provider may still return after timeout or supersession.
+        if asyncio.current_task() is self._classifier_task:
+            self._dispatch(event)
 
     async def _extract_menu(self, turn_id: int, transcript: str) -> None:
         started = time.monotonic()
@@ -548,30 +630,42 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
     async def _wait_for_prediction(self, turn_id: int) -> None:
         """Wait until the turn has a prediction, a newer turn replaced it, or the run finished."""
         while (
-            turn_id == self._fsm.turn_id
+            turn_id == self._turns.turn_id
             and self.lifecycle is not AMDLifecycle.FINISHED
-            and self._fsm.prediction(turn_id) is None
+            and self._turns.prediction(turn_id) is None
         ):
             self._prediction_changed.clear()
             await self._prediction_changed.wait()
 
-    async def _should_reply(self, turn_id: int, chat_ctx: llm.ChatContext) -> AMDReplyDecision:
+    async def _should_reply(self, turn_id: int, chat_ctx: llm.ChatContext) -> ReplyDecision:
         """Wait for the turn's prediction, then add stage instructions when a reply is allowed."""
-        if self._fsm.has_turn(turn_id):
+        if turn_id in self._turns:
             await self._wait_for_prediction(turn_id)
             if (
                 self.lifecycle is not AMDLifecycle.FINISHED
                 and self._session.current_agent is not self._resources.agent
             ):
                 self._finish(AMDReason.AGENT_CHANGED)
-                return AMDReplyDecision(allow=False)
-        reply_decision = self._fsm.authorize_reply(turn_id)
+                return ReplyDecision(allow=False)
+        if (
+            self.lifecycle is AMDLifecycle.FINISHED
+            and self._state.category is AMDCategory.MACHINE_UNAVAILABLE
+        ):
+            return ReplyDecision(allow=False)
+        if turn_id not in self._turns:
+            return ReplyDecision(allow=True)
+        if turn_id != self._turns.turn_id:
+            return ReplyDecision(allow=False)
+        effects = self._dispatch(_fsm.Signal.REPLY_REQUESTED)
+        reply_decision = next(effect for effect in effects if isinstance(effect, ReplyDecision))
+        if reply_decision.track_voicemail:
+            self._voicemail_turn_id = turn_id
         if not reply_decision.allow:
             return reply_decision
         if reply_decision.instructions_for is not None:
             self._add_instructions(chat_ctx, reply_decision.instructions_for, turn_id)
         if (
-            self._fsm.has_turn(turn_id)
+            turn_id in self._turns
             and self.lifecycle is AMDLifecycle.ACTIVE
             and (activity := self._session._activity)
         ):
@@ -582,19 +676,22 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
         self, chat_ctx: llm.ChatContext, stage: AMDCategory, turn_id: int
     ) -> None:
         content = self._instructions[stage]
-        if stage is AMDCategory.MACHINE_IVR and self._fsm.voicemail_message_played:
+        if stage is AMDCategory.MACHINE_IVR and self._state.voicemail_message_played:
             content += "\nThe voicemail message already played locally."
         chat_ctx.add_message(
             id=f"{self._control_prefix}{turn_id}",
             role="user",
             content=content,
-            extra={"amd_run": self._session_id, "amd_stage": self._fsm.category.value},
+            extra={"amd_run": self._session_id, "amd_stage": self._state.category.value},
         )
 
     def _on_reply_generation(
         self, tools: list[llm.Tool | llm.Toolset]
     ) -> list[llm.Tool | llm.Toolset]:
-        if self.lifecycle is AMDLifecycle.ACTIVE and self._fsm.category == AMDCategory.MACHINE_IVR:
+        if (
+            self.lifecycle is AMDLifecycle.ACTIVE
+            and self._state.category == AMDCategory.MACHINE_IVR
+        ):
             from ...beta.tools.send_dtmf import send_dtmf_events
 
             if not any(tool.id == send_dtmf_events.id for tool in tools):
@@ -603,8 +700,11 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
 
     # region: track voicemail speech handle
     def _track_voicemail(self, turn_id: int, handle: SpeechHandle) -> None:
-        if not self._fsm.commit_voicemail_reply(turn_id):
+        if self._voicemail_turn_id != turn_id:
             return
+        if _fsm.Action.TRACK_VOICEMAIL not in self._dispatch(_fsm.Signal.REPLY_COMMITTED):
+            return
+        self._voicemail_turn_id = None
         if self._voicemail_handle is not None:
             self._voicemail_handle.remove_done_callback(self._on_voicemail_done)
         self._voicemail_handle = handle
@@ -625,7 +725,7 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             return
         output = self._session.output.audio
         if output and output.captured_playout_segments > self._voicemail_audio_start:
-            self._fsm.voicemail_played()
+            self._dispatch(_fsm.Signal.VOICEMAIL_PLAYED)
 
     def _on_speech_created(self, event: SpeechCreatedEvent) -> None:
         if self.lifecycle is AMDLifecycle.FINISHED:
@@ -648,27 +748,44 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
         asyncio.get_running_loop().call_soon(self._update_idle)
 
     def _on_deadline(self) -> None:
-        self._apply(self._fsm.deadline_reached(time.monotonic()))
+        self._dispatch(_fsm.Signal.DEADLINE_REACHED)
 
     def _update_idle(self) -> None:
         activity = self._session._activity
-        self._fsm.update_idle(
-            time.monotonic(),
-            session_busy=bool(self._speeches) or activity is None or activity._is_agent_active,
-        )
+        self._state = _fsm.transition(
+            self._state,
+            _fsm.ActivityChanged(
+                bool(self._speeches) or activity is None or activity._is_agent_active
+            ),
+            now=time.monotonic(),
+            options=self._options,
+        ).state
         self._arm_timer()
 
     def _arm_timer(self) -> None:
         if self._timer is not None:
             self._timer.cancel()
             self._timer = None
-        if (at := self._fsm.next_deadline) is not None:
+        if (at := self._state.next_deadline) is not None:
             self._timer = asyncio.get_running_loop().call_later(
                 max(0, at - time.monotonic()), self._on_deadline
             )
 
     def _finish(self, reason: AMDReason) -> None:
-        self._apply([self._fsm.finish(reason)])
+        self._dispatch(_fsm.Finish(reason))
+
+    def _completion(self) -> AMDCompletedEvent:
+        if self.lifecycle is not AMDLifecycle.FINISHED:
+            raise RuntimeError("AMD has not completed")
+        return AMDCompletedEvent(
+            category=self._state.category,
+            reason=self._state.completion_reason,
+            turn_id=self._latest.turn_id if self._latest else self._turns.turn_id,
+            transcript=self._latest.transcript if self._latest else "",
+            prev_turn_category=self._state.previous_turn,
+            prev_stage_category=self._state.previous_stage,
+            voicemail_message_played=self._state.voicemail_message_played,
+        )
 
     async def _cleanup(self) -> None:
         try:
@@ -681,7 +798,7 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
                 self._voicemail_handle = None
             await aio.cancel_and_wait(*self._tasks)
             if activity := self._session._activity:
-                if self._fsm.category == AMDCategory.MACHINE_UNAVAILABLE:
+                if self._state.category == AMDCategory.MACHINE_UNAVAILABLE:
                     activity._cancel_pending_speeches()
                 else:
                     activity._cancel_preemptive_generation()
@@ -700,6 +817,6 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
                         "amd resource cleanup failed", extra={"error_type": type(error).__name__}
                     )
         finally:
-            result = self._fsm.completion()
+            result = self._completion()
             self._resources.completion.set_result(result)
             self.emit("amd_completed", result)
