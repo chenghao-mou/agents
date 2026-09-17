@@ -164,7 +164,8 @@ AMD observes the session's `function_tools_executed` event and retains successfu
 `send_dtmf_events` calls and results in its own chat context. It does not copy the
 session's transcripts or agent speech. Failed or canceled calls are omitted,
 including sequences that sent some digits before failing. The tool raises
-`ToolError` when a publish fails. Custom DTMF tools are not collected automatically.
+`ToolError` when a publish fails. Calls are matched by the name `send_dtmf_events`,
+including application overrides with that name. Tools with other names are ignored.
 DTMF completion alone neither triggers classification nor proves that a person answered.
 
 Menu extraction runs as separate best-effort work. It never holds a reply.
