@@ -45,8 +45,8 @@ class AMDClassifyRequest(BaseModel):
 
 
 @dataclass
-class SpeechWindow:
-    """User speech edges on the monotonic clock. The speech window resets at each commit."""
+class UserSpeechTracker:
+    """Track user speech and silence on the monotonic clock across turn boundaries."""
 
     speaking_since: float | None = None
     silence_since: float | None = None

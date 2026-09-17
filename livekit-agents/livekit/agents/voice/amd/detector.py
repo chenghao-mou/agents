@@ -20,7 +20,7 @@ from ...utils.misc import is_cloud
 from ...utils.participant import wait_for_participant_attribute, wait_for_track_publication
 from . import _fsm, _inference
 from ._transcription import AMDRacingSTT
-from ._turns import AMDClassifyRequest, SpeechWindow, Turn, Turns
+from ._turns import AMDClassifyRequest, Turn, Turns, UserSpeechTracker
 from .events import (
     AMDCategory,
     AMDCompletedEvent,
@@ -271,7 +271,7 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
         self._had_machine_stage = False
         self._state = AMDCategory.UNCERTAIN
         self._turns = Turns()
-        self._user_speech = SpeechWindow()
+        self._user_speech = UserSpeechTracker()
         self._pending_turn: Turn | None = None
         self._latest: AMDPredictionEvent | None = None
         self._voicemail_turn_id: int | None = None
