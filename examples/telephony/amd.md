@@ -23,7 +23,11 @@ Start AgentSession first. Enter AMD before creating the SIP participant.
 Do not generate an `on_enter` greeting before AMD starts.
 
 ```python
+import logging
+
 from livekit.agents import AMD
+
+logger = logging.getLogger("amd-example")
 
 detector = AMD(
     session,
@@ -34,7 +38,10 @@ detector = AMD(
 
 @detector.on("amd_prediction")
 def on_prediction(event):
-    print(event.turn_id, event.category, event.reason)
+    logger.info(
+        "AMD prediction: turn_id=%s category=%s reason=%s",
+        event.turn_id, event.category, event.reason,
+    )
 
 @detector.on("amd_menu_observed")
 def on_menu(event):
@@ -53,6 +60,11 @@ the SIP provider to supply early media.
 `detector.lifecycle` uses `AMDLifecycle`: `INITIALIZED` before context entry, `PENDING`
 while awaiting the participant, `ACTIVE` during detection, and `FINISHED`
 after detection ends. Import `AMDLifecycle` from `livekit.agents`.
+
+AMD allows five seconds for the participant's audio track to be published and
+subscribed. If that fails, it completes with `participant_missing` and releases
+the session. Set the SIP answer timeout when placing the call. The detection
+`timeout` starts when listening begins.
 
 ## Model selection and transcript race
 

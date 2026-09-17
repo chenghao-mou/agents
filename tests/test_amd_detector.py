@@ -1333,6 +1333,57 @@ async def test_supplied_model_is_not_closed_by_amd() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("track_published", [False, True])
+async def test_missing_audio_subscription_times_out_and_releases_session(
+    monkeypatch: pytest.MonkeyPatch, track_published: bool
+) -> None:
+    room = utils.EventEmitter()
+    room.isconnected = lambda: True
+    publication = SimpleNamespace(
+        sid="track", kind=rtc.TrackKind.KIND_AUDIO, subscribed=False, track=None
+    )
+    participant = SimpleNamespace(identity="callee", track_publications={"track": publication})
+    room.remote_participants = {"callee": participant} if track_published else {}
+    session = AgentSession(llm=FakeLLM(), turn_handling={"turn_detection": "manual"})
+    await session.start(Agent(instructions="Hello"))
+    activity = session._activity
+    assert activity is not None
+    session_audio = Mock()
+    monkeypatch.setattr(activity._audio_recognition, "_push_audio", session_audio)
+    session._room_io = SimpleNamespace(room=room, set_participant=Mock())
+    frame = rtc.AudioFrame.create(16000, 1, 320)
+    started = asyncio.get_running_loop().time()
+    try:
+        async with AMD(
+            session, llm=None, stt=None, participant_identity="callee", timeout=0.1
+        ) as detector:
+            await eventually(lambda: bool(room._events.get("track_subscribed")))
+            assert detector.lifecycle is AMDLifecycle.PENDING
+            assert detector._hard_deadline is None
+            assert not activity._authorization_allowed.is_set()
+            activity.push_audio(frame)
+            session_audio.assert_not_called()
+
+            result = await asyncio.wait_for(detector.execute(), 6)
+            assert asyncio.get_running_loop().time() - started == pytest.approx(5, abs=0.01)
+            assert result.reason is AMDReason.PARTICIPANT_MISSING
+            assert result.category is AMDCategory.UNCERTAIN
+            assert detector.lifecycle is AMDLifecycle.FINISHED
+            assert session.amd is None
+            assert session._turn_hooks is None
+            assert activity._authorization_allowed.is_set()
+            assert not detector._tasks
+            assert not any(room._events.values())
+            for emitter, event, handler in detector._subscriptions:
+                assert handler not in emitter._events.get(event, ())
+            activity.push_audio(frame)
+            session_audio.assert_called_once_with(frame, stt_frame=None)
+    finally:
+        session._room_io = None
+        await session.aclose()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("wait_until_answered", [True, False])
 async def test_sip_answer_gating_and_early_media(
     monkeypatch: pytest.MonkeyPatch, wait_until_answered: bool
@@ -1378,6 +1429,7 @@ async def test_sip_answer_gating_and_early_media(
             await subscribed.wait()
             room_io.set_participant.assert_called_once_with("callee")
             if wait_until_answered:
+                await asyncio.sleep(5.1)
                 assert detector.lifecycle is AMDLifecycle.PENDING
                 assert detector._next_deadline is None
                 answered.set()

@@ -47,6 +47,7 @@ if TYPE_CHECKING:
 _DEFAULT_MAX_INFERENCE_TIMEOUTS = 3  # Allow transient delays before abandoning detection.
 _MACHINE_SILENCE_THRESHOLD = 1.5  # Wait for a pause before replying to machines.
 _MENU_TIMEOUT = 5.0  # Stop optional menu work before it becomes stale.
+_TRACK_PUBLICATION_TIMEOUT = 5.0
 _MACHINE_CATEGORIES = frozenset(
     {
         AMDCategory.MACHINE_SCREENING,
@@ -413,13 +414,16 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
                 _start_listening()
                 return
             room = self._session._room_io.room
-            publication = await wait_for_track_publication(
-                room=room,
-                identity=self._participant_identity
-                if is_given(self._participant_identity)
-                else None,
-                kind=rtc.TrackKind.KIND_AUDIO,
-                wait_for_subscription=True,
+            publication = await asyncio.wait_for(
+                wait_for_track_publication(
+                    room=room,
+                    identity=self._participant_identity
+                    if is_given(self._participant_identity)
+                    else None,
+                    kind=rtc.TrackKind.KIND_AUDIO,
+                    wait_for_subscription=True,
+                ),
+                timeout=_TRACK_PUBLICATION_TIMEOUT,
             )
             publisher = next(
                 (
@@ -442,7 +446,7 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
                 )
             if self.lifecycle is not AMDLifecycle.FINISHED:
                 _start_listening()
-        except RuntimeError:
+        except (RuntimeError, asyncio.TimeoutError):
             self._finish(AMDReason.PARTICIPANT_MISSING)
 
     # region: hooks
