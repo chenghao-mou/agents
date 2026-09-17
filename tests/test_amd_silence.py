@@ -844,3 +844,32 @@ async def test_completion_cancels_silence_wait_and_releases_waiters(reason: str)
         assert not detector._reply_held
         assert session.amd is None
         assert not detector._tasks
+
+
+@pytest.mark.asyncio
+async def test_silence_deadline_crossed_while_rearming_still_wakes_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from livekit.agents.voice.amd import detector as detector_module
+
+    async with running(machine_silence_threshold=1.5) as (detector, session, classifier, _):
+        hooks = await commit(detector, session, classifier)
+        classifier.prediction(1, AMDCategory.MACHINE_SCREENING)
+        await eventually(lambda: detector._turns.prediction(1) is not None)
+        reply = asyncio.create_task(hooks.should_reply(llm.ChatContext()))
+        await asyncio.sleep(0)
+        assert not reply.done()
+        release_at = detector._user_speech.silence_since + 1.5
+        readings = iter((release_at - 0.01, release_at - 0.01))
+
+        def clock() -> float:
+            return next(readings, release_at + 0.01)
+
+        with monkeypatch.context() as crossed_deadline:
+            crossed_deadline.setattr(detector_module.time, "monotonic", clock)
+            detector._update_idle()
+            assert detector._timer.when() == pytest.approx(
+                asyncio.get_running_loop().time(), abs=1e-6
+            )
+            assert await asyncio.wait_for(reply, 0.1)
+        assert detector.lifecycle is AMDLifecycle.ACTIVE

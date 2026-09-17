@@ -806,6 +806,9 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
 
     @property
     def _reply_held(self) -> bool:
+        return self._reply_held_at(time.monotonic())
+
+    def _reply_held_at(self, now: float) -> bool:
         if (
             self.lifecycle is not AMDLifecycle.ACTIVE
             or not self._turns.turn_id
@@ -819,29 +822,30 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             and (
                 self._user_speech.speaking
                 or self._user_speech.silence_since is None
-                or time.monotonic()
-                < self._user_speech.silence_since + self._options.machine_silence_threshold
+                or now < self._user_speech.silence_since + self._options.machine_silence_threshold
             )
         )
 
     def _update_idle(self) -> None:
         if self.lifecycle is not AMDLifecycle.ACTIVE or self._check_hard_timeout():
             return
+        now = time.monotonic()
+        reply_held = self._reply_held_at(now)
         if (
             self._inference_timeouts >= self._options.max_inference_timeouts
             and self._pending_turn is None
-            and not self._reply_held
+            and not reply_held
         ):
             self._finish(AMDReason.INFERENCE_TIMEOUT)
             return
         activity = self._session._activity
         busy = (
             self._pending_turn is not None
-            or self._reply_held
+            or reply_held
             or self._user_speech.speaking
             or bool(self._speeches)
             or activity is None
-            or activity._is_agent_active
+            or activity._is_agent_busy
         )
         if busy:
             self._idle_deadline = None
@@ -851,13 +855,16 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
                 if self._state is AMDCategory.MACHINE_VM
                 else self._options.idle_timeout
             )
-            self._idle_deadline = time.monotonic() + timeout
-        self._arm_timer()
+            self._idle_deadline = now + timeout
+        self._arm_timer(now=now)
 
     @property
     def _next_deadline(self) -> float | None:
+        return self._deadline_at(time.monotonic())
+
+    def _deadline_at(self, now: float) -> float | None:
         silence_deadline = None
-        if self._reply_held and self._user_speech.silence_since is not None:
+        if self._reply_held_at(now) and self._user_speech.silence_since is not None:
             silence_deadline = (
                 self._user_speech.silence_since + self._options.machine_silence_threshold
             )
@@ -875,11 +882,11 @@ class AMD(EventEmitter[Literal["amd_prediction", "amd_completed", "amd_menu_obse
             default=None,
         )
 
-    def _arm_timer(self) -> None:
+    def _arm_timer(self, *, now: float | None = None) -> None:
         if self._timer is not None:
             self._timer.cancel()
             self._timer = None
-        if (at := self._next_deadline) is not None:
+        if (at := self._deadline_at(now if now is not None else time.monotonic())) is not None:
             self._timer = asyncio.get_running_loop().call_later(
                 max(0, at - time.monotonic()), self._on_deadline
             )
